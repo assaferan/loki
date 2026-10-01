@@ -8,11 +8,12 @@ scratch. Once that is fixed, call EPFreqSweep on the whole frequency range inste
 
 Usage::
 
-    from ep_sweep_regions import ep_sweep_by_region, load_candidates
+    from ep_sweep_regions import ep_sweep_by_region, group_candidates, load_candidates
 
     paths = ep_sweep_by_region(ts_e, ts_v, cfg_kwargs, "ep_out", "test",
                                sweep_kwargs={"n_runs": 1, "ref_segs": [4]})
     cands = load_candidates(paths)
+    groups = group_candidates(cands)  # one row per signal, harmonics flagged
 
 ``cfg_kwargs`` are PulsarSearchConfig keyword arguments, with ``param_limits`` given
 as a list of ``[min, max]`` rows ending with the frequency row (Hz). The calling
@@ -28,6 +29,7 @@ import logging
 import math
 import subprocess
 import sys
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -218,11 +220,14 @@ def load_candidates(paths: list[Path]) -> pd.DataFrame:
     -------
     pd.DataFrame
         One row per candidate: each parameter and its uncertainty (``d`` prefix),
-        score, score_ep, and the region, chunk and run it came from.
+        score, score_ep, and the region, chunk and run it came from. The observation
+        length is kept in ``attrs["tobs"]`` (s).
     """
     frames = []
+    tobs = None
     for region, path in enumerate(paths):
         with h5py.File(path, "r") as f:
+            tobs = float(f.attrs["tobs"])
             names = [str(name) for name in f.attrs["param_names"]]
             for chunk_name, chunk in f["chunks"].items():
                 for run_name, run in chunk["runs"].items():
@@ -238,7 +243,89 @@ def load_candidates(paths: list[Path]) -> pd.DataFrame:
                     run_frame["chunk"] = chunk_name
                     run_frame["run"] = run_name
                     frames.append(run_frame)
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    cands = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    cands.attrs["tobs"] = tobs
+    return cands
+
+
+def group_candidates(
+    cands: pd.DataFrame,
+    *,
+    freq_tol: float | None = None,
+    harmonic_tol: float | None = None,
+    max_harmonic: int = 4,
+) -> pd.DataFrame:
+    """Collapse candidates into frequency groups and flag harmonically related ones.
+
+    A strong signal survives in many neighbouring trials. Candidates within
+    ``freq_tol`` of a neighbour in frequency form one group, represented by its best
+    candidate by score. A group is a harmonic when its frequency is a/b times that of
+    a stronger, independent group (a, b <= max_harmonic), to within
+    ``harmonic_tol * (1 + a/b)``.
+
+    Parameters
+    ----------
+    cands : pd.DataFrame
+        Candidates from load_candidates.
+    freq_tol : float | None, optional
+        Largest frequency gap (Hz) inside a group. Defaults to 40 / T, with T the
+        observation length: neighbouring trials of a signal at S/N ~15 can be ~25 / T
+        apart.
+    harmonic_tol : float | None, optional
+        Frequency tolerance (Hz) of a harmonic match. Defaults to 2 / T.
+    max_harmonic : int, optional
+        Largest numerator and denominator of the harmonic ratios tried.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per group, strongest first: the best candidate's columns, plus n (the
+        group's size), f_lo and f_hi (its frequency span), harmonic_of (the frequency
+        of the group it is a harmonic of, NaN if independent) and ratio ("a/b").
+    """
+    if cands.empty:
+        return cands.copy()
+    tobs = cands.attrs.get("tobs")
+    if (freq_tol is None or harmonic_tol is None) and tobs is None:
+        msg = "Pass freq_tol and harmonic_tol, or candidates from load_candidates"
+        raise ValueError(msg)
+    freq_tol = 40 / tobs if freq_tol is None else freq_tol
+    harmonic_tol = 2 / tobs if harmonic_tol is None else harmonic_tol
+
+    by_freq = cands.sort_values("freq", ignore_index=True)
+    group_id = (by_freq["freq"].diff() > freq_tol).cumsum()
+    spans = by_freq.groupby(group_id)["freq"].agg(["size", "min", "max"])
+    groups = by_freq.loc[by_freq.groupby(group_id)["score"].idxmax()]
+    groups = groups.assign(
+        n=spans["size"].to_numpy(),
+        f_lo=spans["min"].to_numpy(),
+        f_hi=spans["max"].to_numpy(),
+    ).sort_values("score", ascending=False, ignore_index=True)
+
+    ratios = sorted(
+        {
+            Fraction(a, b)
+            for a in range(1, max_harmonic + 1)
+            for b in range(1, max_harmonic + 1)
+            if a != b
+        },
+    )
+    harmonic_of = np.full(len(groups), np.nan)
+    ratio = [""] * len(groups)
+    independent = []
+    for i, freq in enumerate(groups["freq"]):
+        for parent in independent:
+            match = next(
+                (r for r in ratios if abs(freq - r * parent) <= harmonic_tol * (1 + r)),
+                None,
+            )
+            if match is not None:
+                harmonic_of[i] = parent
+                ratio[i] = f"{match.numerator}/{match.denominator}"
+                break
+        else:
+            independent.append(freq)
+    return groups.assign(harmonic_of=harmonic_of, ratio=ratio)
 
 
 def _run_region(spec_path: str) -> None:
