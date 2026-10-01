@@ -190,9 +190,10 @@ def injection_test(
 
     An injection is recovered when a detected group (search_timeseries) lies within
     freq_tolerance of its frequency. A detected group can also be a harmonic of an
-    injection, if harmonic_parent can tell it from chance, with p_max = 1 / (number of
-    detected groups). Detected groups that are neither are false alarms, or real
-    signals already in the data.
+    injection, if harmonic_parent can tell it from chance and its S/N is possible for
+    a harmonic of the injected S/N, with p_max = 1 / (number of detected groups).
+    Detected groups that are neither are false alarms, or real signals already in the
+    data.
 
     Returns
     -------
@@ -246,7 +247,15 @@ def injection_test(
         for inj in injections
     ]
     for k in np.flatnonzero(groups["detected"].to_numpy() & (match < 0)):
-        found = harmonic_parent(groups["freq"].iloc[k], windows, band=band, p_max=p_max)
+        found = harmonic_parent(
+            groups["freq"].iloc[k],
+            windows,
+            band=band,
+            p_max=p_max,
+            score=groups["score"].iloc[k],
+            parent_scores=[snr] * len(injections),
+            snr_threshold=snr_threshold,
+        )
         if found is not None:
             match[k] = found[0]
             relation[k] = f"{found[1].numerator}/{found[1].denominator}"

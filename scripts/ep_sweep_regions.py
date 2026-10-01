@@ -345,12 +345,30 @@ def harmonic_windows(
     return levels
 
 
+def harmonic_snr_fraction(ratio: Fraction) -> float:
+    """Largest fraction of a parent's measured S/N that its a/b harmonic can show.
+
+    Folding a boxcar pulsar of duty d at a/b times its frequency shows b pulses of
+    duty (a/b) d with 1/b of the signal each: at most 1 / sqrt(a b) of its true S/N.
+    Both folds also lose S/N to the search's phase tolerance, the same fraction s of a
+    cycle in every region, keeping sqrt(d / (d + s)) of the fundamental and
+    sqrt((a/b) d / ((a/b) d + s)) of the harmonic. That ratio is at most sqrt(a/b)
+    when a > b and at most 1 otherwise, whatever d: so the harmonic shows at most the
+    parent's measured S/N times 1/b (a > b) or 1 / sqrt(a b) (a < b).
+    """
+    a, b = ratio.numerator, ratio.denominator
+    return 1 / b if a > b else 1 / math.sqrt(a * b)
+
+
 def harmonic_parent(
     freq: float,
     parents: list[dict[int, list[tuple[Fraction, float, float]]]],
     *,
     band: tuple[float, float],
     p_max: float,
+    score: float | None = None,
+    parent_scores: list[float] | None = None,
+    snr_threshold: float | None = None,
 ) -> tuple[int, Fraction] | None:
     """Explain freq as a harmonic of one of several parents, if chance can't.
 
@@ -358,7 +376,10 @@ def harmonic_parent(
     every parent's ratios at that level (from harmonic_windows). The first level with
     a window holding freq gives the match, if the chance of an unrelated frequency
     falling in some window up to that level is at most p_max; the strongest parent
-    wins ties.
+    wins ties. Given snr_threshold, a match must also be possible in S/N: score may
+    exceed what the harmonic can show (harmonic_snr_fraction times the parent's
+    score) by at most snr_threshold, the S/N noise reaches in the whole search; a
+    larger excess is a detection in its own right.
 
     Returns
     -------
@@ -373,7 +394,11 @@ def harmonic_parent(
         for j, levels in enumerate(parents):
             for ratio, target, half in levels.get(level, []):
                 chance += 2 * half / width
-                if found is None and abs(freq - target) <= half:
+                plausible = snr_threshold is None or (
+                    score
+                    <= harmonic_snr_fraction(ratio) * parent_scores[j] + snr_threshold
+                )
+                if found is None and abs(freq - target) <= half and plausible:
                     found = (j, ratio)
         if chance > p_max:
             return None
@@ -387,6 +412,7 @@ def group_candidates(
     *,
     drifts: list[tuple[int, float]] | None = None,
     band: tuple[float, float] | None = None,
+    snr_threshold: float | None = None,
 ) -> pd.DataFrame:
     """Collapse candidates into frequency groups and flag harmonically related ones.
 
@@ -395,7 +421,7 @@ def group_candidates(
     score. Going from the strongest group down, a group is a harmonic of a stronger,
     independent group when harmonic_parent can tell it from chance, with
     p_max = 1 / (number of groups): fewer than one chance attribution expected over
-    the whole list.
+    the whole list. Given snr_threshold, the match must also be possible in S/N.
 
     Parameters
     ----------
@@ -406,6 +432,9 @@ def group_candidates(
         spread of the candidates' own drift parameters.
     band : tuple[float, float] | None, optional
         Searched frequency range (Hz). Defaults to the candidates' frequency range.
+    snr_threshold : float | None, optional
+        The search's detection threshold (see harmonic_parent). Without it, harmonics
+        are judged by their frequencies alone.
 
     Returns
     -------
@@ -435,14 +464,26 @@ def group_candidates(
     harmonic_of = np.full(len(groups), np.nan)
     ratio = [""] * len(groups)
     parent_freqs: list[float] = []  # independent groups so far, strongest first
+    parent_scores: list[float] = []
     parent_windows: list[dict[int, list[tuple[Fraction, float, float]]]] = []
-    for i, freq in enumerate(groups["freq"]):
-        match = harmonic_parent(freq, parent_windows, band=band, p_max=p_max)
+    for i, (freq, score) in enumerate(
+        zip(groups["freq"], groups["score"], strict=True),
+    ):
+        match = harmonic_parent(
+            freq,
+            parent_windows,
+            band=band,
+            p_max=p_max,
+            score=score,
+            parent_scores=parent_scores,
+            snr_threshold=snr_threshold,
+        )
         if match is not None:
             harmonic_of[i] = parent_freqs[match[0]]
             ratio[i] = f"{match[1].numerator}/{match[1].denominator}"
         else:
             parent_freqs.append(freq)
+            parent_scores.append(score)
             parent_windows.append(
                 harmonic_windows(
                     freq,
@@ -490,6 +531,7 @@ def search_timeseries(
         load_candidates(paths),
         drifts=drift_ranges(cfg_kwargs),
         band=tuple(cfg_kwargs["param_limits"][-1]),
+        snr_threshold=snr_threshold,
     )
     if groups.empty:
         return groups.assign(detected=pd.Series(dtype=bool))
