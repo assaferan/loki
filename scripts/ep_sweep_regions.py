@@ -169,7 +169,8 @@ def ep_sweep_by_region(
     cfg_kwargs : dict[str, Any]
         PulsarSearchConfig keyword arguments for the whole search.
     outdir : str | Path
-        Directory for the results, logs, region specs and the time series copy.
+        Directory for the results, logs and region specs. The copy of the time
+        series the region processes read is removed once they finish.
     prefix : str
         File prefix; region i writes ``{prefix}_r{i:02d}_ep_results.h5``.
     loki_site : str | Path | None, optional
@@ -191,35 +192,40 @@ def ep_sweep_by_region(
     np.save(ts_e_path, np.asarray(ts_e, dtype=np.float32))
     np.save(ts_v_path, np.asarray(ts_v, dtype=np.float32))
     paths = []
-    for i, (region, rcfg) in enumerate(region_configs(cfg_kwargs)):
-        rprefix = f"{prefix}_r{i:02d}"
-        spec = {
-            "loki_site": None if loki_site is None else str(loki_site),
-            "ts_e": str(ts_e_path),
-            "ts_v": str(ts_v_path),
-            "cfg": rcfg,
-            "sweep": sweep_kwargs or {},
-            "outdir": str(outdir),
-            "prefix": rprefix,
-        }
-        spec_path = outdir / f"{rprefix}_spec.json"
-        spec_path.write_text(json.dumps(spec, indent=1))
-        logger.info(
-            f"Region {i}: f=[{region['f_start']:.3f}, {region['f_end']:.3f}] Hz, "
-            f"nbins={region['nbins']}, eta={region['eta']:.3f}",
-        )
-        log_path = outdir / f"{rprefix}.log"
-        with log_path.open("w") as log:
-            proc = subprocess.run(  # noqa: S603 - runs this file with our own spec
-                [sys.executable, __file__, str(spec_path)],
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                check=False,
+    try:
+        for i, (region, rcfg) in enumerate(region_configs(cfg_kwargs)):
+            rprefix = f"{prefix}_r{i:02d}"
+            spec = {
+                "loki_site": None if loki_site is None else str(loki_site),
+                "ts_e": str(ts_e_path),
+                "ts_v": str(ts_v_path),
+                "cfg": rcfg,
+                "sweep": sweep_kwargs or {},
+                "outdir": str(outdir),
+                "prefix": rprefix,
+            }
+            spec_path = outdir / f"{rprefix}_spec.json"
+            spec_path.write_text(json.dumps(spec, indent=1))
+            logger.info(
+                f"Region {i}: f=[{region['f_start']:.3f}, {region['f_end']:.3f}] Hz, "
+                f"nbins={region['nbins']}, eta={region['eta']:.3f}",
             )
-        if proc.returncode != 0:
-            msg = f"Region {i} failed (exit code {proc.returncode}), see {log_path}"
-            raise RuntimeError(msg)
-        paths.append(outdir / f"{rprefix}_ep_results.h5")
+            log_path = outdir / f"{rprefix}.log"
+            with log_path.open("w") as log:
+                proc = subprocess.run(  # noqa: S603 - runs this file with our own spec
+                    [sys.executable, __file__, str(spec_path)],
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    check=False,
+                )
+            if proc.returncode != 0:
+                msg = f"Region {i} failed (exit code {proc.returncode}), see {log_path}"
+                raise RuntimeError(msg)
+            paths.append(outdir / f"{rprefix}_ep_results.h5")
+    finally:
+        # Only the region processes read the series copy
+        ts_e_path.unlink(missing_ok=True)
+        ts_v_path.unlink(missing_ok=True)
     return paths
 
 
