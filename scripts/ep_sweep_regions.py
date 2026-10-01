@@ -91,6 +91,15 @@ def ffa_regions(
 
 
 def _regions_of(cfg_kwargs: dict[str, Any]) -> list[dict[str, float]]:
+    # No fallbacks: copies of loki's defaults here could silently drift from them
+    missing = [
+        key
+        for key in ("tsamp", "nbins", "eta", "octave_scale", "nbins_max")
+        if key not in cfg_kwargs
+    ]
+    if missing:
+        msg = f"cfg_kwargs must set {missing} explicitly"
+        raise KeyError(msg)
     f_min, f_max = cfg_kwargs["param_limits"][-1]
     return ffa_regions(
         1 / f_max,
@@ -98,8 +107,8 @@ def _regions_of(cfg_kwargs: dict[str, Any]) -> list[dict[str, float]]:
         cfg_kwargs["tsamp"],
         cfg_kwargs["nbins"],
         cfg_kwargs["eta"],
-        cfg_kwargs.get("octave_scale", 2.0),
-        cfg_kwargs.get("nbins_max", 1024),
+        cfg_kwargs["octave_scale"],
+        cfg_kwargs["nbins_max"],
     )
 
 
@@ -123,11 +132,11 @@ def region_configs(
         rcfg["param_limits"].append([region["f_start"], region["f_end"]])
         rcfg["nbins"] = region["nbins"]
         rcfg["eta"] = region["eta"]
-        # Wide enough that rounding in 1/f can't split off a sliver as a second region
-        rcfg["octave_scale"] = 2 * max(
-            region["f_end"] / region["f_start"],
-            cfg_kwargs.get("octave_scale", 2.0),
-        )
+        # The region's own period ratio, stepped up by the least amount that keeps
+        # rounding in 1/f from splitting off a sliver as a second region
+        rcfg["octave_scale"] = region["f_end"] / region["f_start"]
+        while len(_regions_of(rcfg)) > 1:
+            rcfg["octave_scale"] = math.nextafter(rcfg["octave_scale"], math.inf)
         replanned = _regions_of(rcfg)
         if (
             len(replanned) != 1

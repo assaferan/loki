@@ -43,6 +43,7 @@ def main(outdir: Path) -> int:
         "use_fourier": False,
         "nthreads": 8,
         "octave_scale": 2.0,
+        "nbins_max": 1024,
         "bseg_brute": 1024,
         "bseg_ffa": NSAMPS // 8,
         "snr_min": 5.0,
