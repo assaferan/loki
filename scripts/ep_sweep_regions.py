@@ -298,52 +298,98 @@ def freq_tolerance(
     )
 
 
-def _harmonic_ratio(
-    freq: float,
-    tol: float,
-    score: float,
+def harmonic_windows(
     parent_freq: float,
-    parent_tol: float,
-    parent_score: float,
-) -> Fraction | None:
-    """Simplest a/b with freq ~ a/b * parent_freq that the parent can explain.
+    *,
+    tobs: float,
+    drifts: list[tuple[int, float]],
+    band: tuple[float, float],
+    p_max: float,
+) -> dict[int, list[tuple[Fraction, float, float]]]:
+    """Harmonic windows of parent_freq, by ratio complexity.
 
-    For boxcar pulses, folding at a/b times a pulsar's frequency keeps at most
-    S/N / sqrt(a b). Scores are in units of their own noise, so allowing each one unit
-    of noise, only ratios with a b <= ((parent_score + 1) / (score - 1))**2 qualify;
-    a score within one unit of zero isn't attributed. The match tolerance adds both
-    frequencies' spreads.
+    Ratios a/b (coprime, a != b) inside the band, each with the window
+    |freq - a/b parent_freq| <= freq_tolerance(a/b parent_freq) + a/b
+    freq_tolerance(parent_freq), grouped by their complexity a b. An unrelated
+    frequency, uniform over the band, falls in a given window with probability its
+    width over the band's. Levels are added until this parent's windows alone exceed
+    p_max: no match beyond that level can count (see harmonic_parent).
+
+    Returns
+    -------
+    dict[int, list[tuple[Fraction, float, float]]]
+        For each level a b: (ratio, frequency, window half-width) per ratio.
     """
-    if score <= 1:
-        return None
-    max_ab = math.floor(((parent_score + 1) / (score - 1)) ** 2)
-    b = np.arange(1, max_ab + 1)
-    a = np.rint(freq * b / parent_freq).astype(int)
-    r = a / b
-    ok = (
-        (a >= 1)
-        & (a != b)
-        & (np.gcd(a, b) == 1)
-        & (a * b <= max_ab)
-        & (np.abs(freq - r * parent_freq) <= tol + r * parent_tol)
-    )
-    if not ok.any():
-        return None
-    k = np.flatnonzero(ok)[np.argmin((a * b)[ok])]
-    return Fraction(int(a[k]), int(b[k]))
+    f_lo, f_hi = band
+    tol_parent = freq_tolerance(parent_freq, tobs, drifts)
+    levels: dict[int, list[tuple[Fraction, float, float]]] = {}
+    chance = 0.0
+    level = 1
+    while chance <= p_max:
+        level += 1
+        for a in range(1, level + 1):
+            b, rem = divmod(level, a)
+            if rem or a == b or math.gcd(a, b) != 1:
+                continue
+            target = a * parent_freq / b
+            if f_lo <= target <= f_hi:
+                half = freq_tolerance(target, tobs, drifts) + a / b * tol_parent
+                levels.setdefault(level, []).append((Fraction(a, b), target, half))
+                chance += 2 * half / (f_hi - f_lo)
+    return levels
+
+
+def harmonic_parent(
+    freq: float,
+    parents: list[dict[int, list[tuple[Fraction, float, float]]]],
+    *,
+    band: tuple[float, float],
+    p_max: float,
+) -> tuple[int, Fraction] | None:
+    """Explain freq as a harmonic of one of several parents, if chance can't.
+
+    Goes through ratio complexities a b in increasing order, adding up the windows of
+    every parent's ratios at that level (from harmonic_windows). The first level with
+    a window holding freq gives the match, if the chance of an unrelated frequency
+    falling in some window up to that level is at most p_max; the strongest parent
+    wins ties.
+
+    Returns
+    -------
+    tuple[int, Fraction] | None
+        Index of the parent in parents and the ratio, or None.
+    """
+    width = band[1] - band[0]
+    chance = 0.0
+    top = max((max(levels) for levels in parents if levels), default=1)
+    for level in range(2, top + 1):
+        found = None
+        for j, levels in enumerate(parents):
+            for ratio, target, half in levels.get(level, []):
+                chance += 2 * half / width
+                if found is None and abs(freq - target) <= half:
+                    found = (j, ratio)
+        if chance > p_max:
+            return None
+        if found is not None:
+            return found
+    return None
 
 
 def group_candidates(
     cands: pd.DataFrame,
     *,
     drifts: list[tuple[int, float]] | None = None,
+    band: tuple[float, float] | None = None,
 ) -> pd.DataFrame:
     """Collapse candidates into frequency groups and flag harmonically related ones.
 
     A strong signal survives in many neighbouring trials. Candidates whose frequency
     gap is within freq_tolerance form one group, represented by its best candidate by
-    score. A group is a harmonic when its frequency is a/b times that of a stronger,
-    independent group that can explain its score (see _harmonic_ratio).
+    score. Going from the strongest group down, a group is a harmonic of a stronger,
+    independent group when harmonic_parent can tell it from chance, with
+    p_max = 1 / (number of groups): fewer than one chance attribution expected over
+    the whole list.
 
     Parameters
     ----------
@@ -352,6 +398,8 @@ def group_candidates(
     drifts : list[tuple[int, float]] | None, optional
         Searched drift ranges, as from drift_ranges(cfg_kwargs). Defaults to the
         spread of the candidates' own drift parameters.
+    band : tuple[float, float] | None, optional
+        Searched frequency range (Hz). Defaults to the candidates' frequency range.
 
     Returns
     -------
@@ -364,6 +412,7 @@ def group_candidates(
         return cands.copy()
     tobs = cands.attrs["tobs"]
     drifts = _observed_drift_ranges(cands) if drifts is None else drifts
+    band = (cands["freq"].min(), cands["freq"].max()) if band is None else band
 
     by_freq = cands.sort_values("freq", ignore_index=True)
     tol = freq_tolerance(by_freq["freq"], tobs, drifts)
@@ -376,20 +425,27 @@ def group_candidates(
         f_hi=spans["max"].to_numpy(),
     ).sort_values("score", ascending=False, ignore_index=True)
 
+    p_max = 1 / len(groups)
     harmonic_of = np.full(len(groups), np.nan)
     ratio = [""] * len(groups)
-    independent = []  # (freq, tolerance, score) of each independent group so far
-    scores = groups["score"]
-    for i, (freq, score) in enumerate(zip(groups["freq"], scores, strict=True)):
-        tol_i = freq_tolerance(freq, tobs, drifts)
-        for parent in independent:
-            match = _harmonic_ratio(freq, tol_i, score, *parent)
-            if match is not None:
-                harmonic_of[i] = parent[0]
-                ratio[i] = f"{match.numerator}/{match.denominator}"
-                break
+    parent_freqs: list[float] = []  # independent groups so far, strongest first
+    parent_windows: list[dict[int, list[tuple[Fraction, float, float]]]] = []
+    for i, freq in enumerate(groups["freq"]):
+        match = harmonic_parent(freq, parent_windows, band=band, p_max=p_max)
+        if match is not None:
+            harmonic_of[i] = parent_freqs[match[0]]
+            ratio[i] = f"{match[1].numerator}/{match[1].denominator}"
         else:
-            independent.append((freq, tol_i, score))
+            parent_freqs.append(freq)
+            parent_windows.append(
+                harmonic_windows(
+                    freq,
+                    tobs=tobs,
+                    drifts=drifts,
+                    band=band,
+                    p_max=p_max,
+                ),
+            )
     return groups.assign(harmonic_of=harmonic_of, ratio=ratio)
 
 
