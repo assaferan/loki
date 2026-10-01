@@ -9,17 +9,31 @@
 
 ``fap`` is the false-alarm probability over the whole search and ``completeness`` the
 probability of reporting a pulsar whose S/N is ``snr_min``; both are the user's choice.
+injection_test injects pulsars into a time series, searches it with
+search_timeseries, and reports which were recovered.
 """
 
 from __future__ import annotations
 
 import itertools
 import math
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from ep_sweep_regions import drift_ranges, region_configs
+import numpy as np
+import pandas as pd
+from ep_sweep_regions import (
+    drift_ranges,
+    freq_tolerance,
+    harmonic_parent,
+    harmonic_windows,
+    region_configs,
+    search_timeseries,
+)
 from scipy.constants import speed_of_light
 from scipy.stats import norm
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def box_widths(nbins: int, ducy_max: float, wtsp: float) -> list[int]:
@@ -117,3 +131,118 @@ def target_snr(snr_threshold: float, completeness: float) -> float:
     A measured S/N scatters about the true one with unit variance.
     """
     return float(snr_threshold + norm.ppf(completeness))
+
+
+def inject_pulsars(
+    ts_e: np.ndarray,
+    ts_v: np.ndarray,
+    tsamp: float,
+    injections: list[dict[str, Any]],
+    *,
+    duty: float,
+    snr: float,
+) -> np.ndarray:
+    """Return a copy of ts_e with boxcar pulse trains added.
+
+    Each injection gives "freq" (Hz, at the first sample) and optionally "phase"
+    (cycles) and "drift" (velocity derivatives, in the order of param_limits' drift
+    rows: highest order first). A pulse is on while
+    (phase + freq * (t + sum_k d_k t^(k+1) / ((k+1)! c))) mod 1 < duty. Under the
+    inverse-variance weighting of (ts_e, ts_v), a pulse of constant physical amplitude
+    adds A * ts_v to ts_e, and A is set so that each train's ideal matched-filter S/N,
+    A * sqrt(duty * (1 - duty) * sum(ts_v)), is snr.
+    """
+    ts_v = np.asarray(ts_v, dtype=np.float64)
+    t = np.arange(len(ts_e)) * tsamp
+    amplitude = snr / math.sqrt(duty * (1 - duty) * ts_v.sum())
+    out = np.array(ts_e, dtype=np.float64)
+    for inj in injections:
+        drift = inj.get("drift", ())
+        delay = t.copy()
+        for i, d in enumerate(drift):
+            order = len(drift) - i
+            delay += d * t ** (order + 1) / (math.factorial(order + 1) * speed_of_light)
+        phase = (inj.get("phase", 0.0) + inj["freq"] * delay) % 1.0
+        out += amplitude * ts_v * (phase < duty)
+    return out
+
+
+def injection_test(
+    ts_e: np.ndarray,
+    ts_v: np.ndarray,
+    cfg_kwargs: dict[str, Any],
+    injections: list[dict[str, Any]],
+    outdir: str | Path,
+    prefix: str,
+    *,
+    duty: float,
+    snr: float,
+    snr_threshold: float,
+    loki_site: str | Path | None = None,
+    sweep_kwargs: dict[str, Any] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Inject pulsars into a time series, search it, and check what is recovered.
+
+    An injection is recovered when a detected group (search_timeseries) lies within
+    freq_tolerance of its frequency. A detected group can also be a harmonic of an
+    injection, if harmonic_parent can tell it from chance, with p_max = 1 / (number of
+    detected groups). Detected groups that are neither are false alarms, or real
+    signals already in the data.
+
+    Returns
+    -------
+    tuple[pd.DataFrame, pd.DataFrame]
+        Per injection: its freq, recovered, and the matching group's freq and score.
+        The groups, with "injection" the index of the injection each detected group
+        matches (-1 if none) and "relation" its ratio to it ("1/1" for the
+        fundamental).
+    """
+    injected = inject_pulsars(
+        ts_e,
+        ts_v,
+        cfg_kwargs["tsamp"],
+        injections,
+        duty=duty,
+        snr=snr,
+    )
+    groups = search_timeseries(
+        injected,
+        ts_v,
+        cfg_kwargs,
+        outdir,
+        prefix,
+        snr_threshold=snr_threshold,
+        loki_site=loki_site,
+        sweep_kwargs=sweep_kwargs,
+    )
+    tobs = cfg_kwargs["nsamps"] * cfg_kwargs["tsamp"]
+    drifts = drift_ranges(cfg_kwargs)
+    match = np.full(len(groups), -1)
+    relation = [""] * len(groups)
+    rows = []
+    for i, inj in enumerate(injections):
+        tol_inj = freq_tolerance(inj["freq"], tobs, drifts)
+        near = groups["detected"] & ((groups["freq"] - inj["freq"]).abs() <= tol_inj)
+        for k in np.flatnonzero(near.to_numpy()):
+            match[k], relation[k] = i, "1/1"
+        best = groups[near].nlargest(1, "score")
+        rows.append(
+            {
+                "freq": inj["freq"],
+                "recovered": not best.empty,
+                "group_freq": best["freq"].iloc[0] if not best.empty else np.nan,
+                "score": best["score"].iloc[0] if not best.empty else np.nan,
+            },
+        )
+    band = tuple(cfg_kwargs["param_limits"][-1])
+    p_max = 1 / max(int(groups["detected"].sum()), 1)
+    windows = [
+        harmonic_windows(inj["freq"], tobs=tobs, drifts=drifts, band=band, p_max=p_max)
+        for inj in injections
+    ]
+    for k in np.flatnonzero(groups["detected"].to_numpy() & (match < 0)):
+        found = harmonic_parent(groups["freq"].iloc[k], windows, band=band, p_max=p_max)
+        if found is not None:
+            match[k] = found[0]
+            relation[k] = f"{found[1].numerator}/{found[1].denominator}"
+    return pd.DataFrame(rows), groups.assign(injection=match, relation=relation)

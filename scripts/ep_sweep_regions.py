@@ -449,6 +449,49 @@ def group_candidates(
     return groups.assign(harmonic_of=harmonic_of, ratio=ratio)
 
 
+def search_timeseries(
+    ts_e: np.ndarray,
+    ts_v: np.ndarray,
+    cfg_kwargs: dict[str, Any],
+    outdir: str | Path,
+    prefix: str,
+    *,
+    snr_threshold: float,
+    loki_site: str | Path | None = None,
+    sweep_kwargs: dict[str, Any] | None = None,
+) -> pd.DataFrame:
+    """Search a time series and report its signals.
+
+    Runs ep_sweep_by_region, groups the candidates with the config's drift ranges,
+    and marks as detected each independent group (not a harmonic of a stronger one)
+    whose score reaches snr_threshold (see ep_calibration.detection_threshold).
+
+    Returns
+    -------
+    pd.DataFrame
+        group_candidates' groups, strongest first, with a boolean "detected" column.
+    """
+    paths = ep_sweep_by_region(
+        ts_e,
+        ts_v,
+        cfg_kwargs,
+        outdir,
+        prefix,
+        loki_site=loki_site,
+        sweep_kwargs=sweep_kwargs,
+    )
+    groups = group_candidates(
+        load_candidates(paths),
+        drifts=drift_ranges(cfg_kwargs),
+        band=tuple(cfg_kwargs["param_limits"][-1]),
+    )
+    if groups.empty:
+        return groups.assign(detected=pd.Series(dtype=bool))
+    return groups.assign(
+        detected=(groups["score"] >= snr_threshold) & groups["harmonic_of"].isna(),
+    )
+
+
 def _run_region(spec_path: str) -> None:
     spec = json.loads(Path(spec_path).read_text())
     if spec["loki_site"]:

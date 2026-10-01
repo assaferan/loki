@@ -1,10 +1,13 @@
 # ruff: noqa: INP001
-"""Synthetic demo of ep_sweep_regions: two pulsars in two regions with different nbins.
+"""Synthetic injection test of the region-by-region EP search.
+
+Injects one pulsar into each of two coarse regions with different nbins, in Gaussian
+noise, searches with a threshold set by a false-alarm probability, and exits non-zero
+unless both pulsars are detected, nothing else is, and their harmonics are flagged.
 
 Build this branch first, e.g. from the repository root with
 ``pip install --no-build-isolation --no-deps --target build/site .``; the demo imports
-loki from build/site when it exists. Exits non-zero unless each region's best candidate
-is its injected pulsar, and the strong independent groups are exactly those pulsars.
+loki from build/site when it exists.
 
     python scripts/ep_sweep_regions_demo.py [outdir]
 """
@@ -16,76 +19,94 @@ import sys
 from pathlib import Path
 
 import numpy as np
-from ep_sweep_regions import ep_sweep_by_region, group_candidates, load_candidates
+from ep_calibration import (
+    detection_threshold,
+    effective_trials,
+    injection_test,
+    target_snr,
+)
 
 logger = logging.getLogger(__name__)
 
+SEED = 1  # noise realization
 NSAMPS = 2**16
 TSAMP = 64e-6
-# One pulsar in each region: [100, 200] Hz folds with 32 bins, [50, 100] Hz with 64
-F_INJ = (120.0, 70.0)
+FAP = 1e-3  # false-alarm probability over the whole search
+COMPLETENESS = 0.9  # for a pulsar at snr_min
+# One pulsar per region: [100, 200] Hz folds with 32 bins, [50, 100] Hz with 64
+INJECTIONS = [{"freq": 120.0}, {"freq": 70.0}]
+DUTY = 0.05
+# Ideal S/N, far above the threshold: checks the pipeline, not its sensitivity
+INJECTED_SNR = 25.0
+CFG = {
+    "nsamps": NSAMPS,
+    "tsamp": TSAMP,
+    "nbins": 32,
+    "eta": 1.0,
+    "param_limits": [[-10.0, 10.0], [50.0, 200.0]],  # accel (m/s^2), freq (Hz)
+    "ducy_max": 0.3,
+    "wtsp": 1.5,
+    "use_fourier": False,
+    "nthreads": 8,
+    "octave_scale": 2.0,
+    "nbins_max": 1024,
+    "bseg_brute": 1024,
+    "bseg_ffa": NSAMPS // 8,
+    "prune_poly_order": 2,
+}
+SWEEP = {"show_progress": False, "n_runs": 1, "ref_segs": [4]}
 
 
 def main(outdir: Path) -> int:
-    rng = np.random.default_rng(1)
-    t = np.arange(NSAMPS) * TSAMP
+    rng = np.random.default_rng(SEED)
     ts_e = rng.normal(size=NSAMPS)
-    for f_inj in F_INJ:
-        ts_e += 0.5 * (((t * f_inj) % 1.0) < 0.05)
     ts_v = np.ones(NSAMPS)
-    cfg_kwargs = {
-        "nsamps": NSAMPS,
-        "tsamp": TSAMP,
-        "nbins": 32,
-        "eta": 1.0,
-        "param_limits": [[-10.0, 10.0], [50.0, 200.0]],  # accel (m/s^2), freq (Hz)
-        "ducy_max": 0.3,
-        "use_fourier": False,
-        "nthreads": 8,
-        "octave_scale": 2.0,
-        "nbins_max": 1024,
-        "bseg_brute": 1024,
-        "bseg_ffa": NSAMPS // 8,
-        "snr_min": 5.0,
-        "prune_poly_order": 2,
-    }
+    n_eff = effective_trials(CFG)
+    snr_threshold = detection_threshold(n_eff, FAP)
+    cfg = {**CFG, "snr_min": target_snr(snr_threshold, COMPLETENESS)}
+    logger.info(
+        f"N_eff {n_eff:.3g}: threshold {snr_threshold:.2f} at FAP {FAP}, "
+        f"snr_min {cfg['snr_min']:.2f}",
+    )
     site = Path(__file__).resolve().parents[1] / "build" / "site"
-    paths = ep_sweep_by_region(
+    results, groups = injection_test(
         ts_e,
         ts_v,
-        cfg_kwargs,
+        cfg,
+        INJECTIONS,
         outdir,
         "demo",
+        duty=DUTY,
+        snr=INJECTED_SNR,
+        snr_threshold=snr_threshold,
         loki_site=site if site.is_dir() else None,
-        sweep_kwargs={"show_progress": False, "n_runs": 1, "ref_segs": [4]},
+        sweep_kwargs=SWEEP,
     )
-    cands = load_candidates(paths)
-    ok = True
-    for region, f_inj in enumerate(F_INJ):
-        best = cands[cands["region"] == region].nlargest(1, "score").iloc[0]
-        found = abs(best["freq"] - f_inj) <= best["dfreq"]
-        logger.info(
-            f"Region {region}: best {best['freq']:.4f} +- {best['dfreq']:.4f} Hz, "
-            f"accel {best['accel']:.2f}, S/N {best['score']:.1f} "
-            f"(injected {f_inj} Hz: {'found' if found else 'NOT found'})",
+    for row in results.itertuples():
+        found = (
+            f"recovered at {row.group_freq:.4f} Hz, S/N {row.score:.1f}"
+            if row.recovered
+            else "NOT recovered"
         )
-        ok &= found
-
-    # Grouped, the strong independent signals are the injected pulsars alone; their
-    # harmonics (e.g. 140 Hz = 2 x 70 Hz) are flagged
-    groups = group_candidates(cands)
-    strong = groups[groups["score"] >= 10]
-    for row in strong.itertuples():
-        relation = f", {row.ratio} x {row.harmonic_of:.4f} Hz" if row.ratio else ""
+        logger.info(f"Injected {row.freq} Hz: {found}")
+    # Above the threshold, the search itself flags harmonics of stronger groups;
+    # the injection test also explains detections at harmonics of an injection
+    flagged = groups[(groups["score"] >= snr_threshold) & groups["harmonic_of"].notna()]
+    for row in flagged.itertuples():
         logger.info(
-            f"Group {row.freq:.4f} Hz: S/N {row.score:.1f}, {row.n} candidates"
-            f"{relation}",
+            f"Flagged harmonic {row.freq:.4f} Hz = {row.ratio} x "
+            f"{row.harmonic_of:.4f} Hz, S/N {row.score:.1f}",
         )
-    signals = np.sort(strong.loc[strong["harmonic_of"].isna(), "freq"].to_numpy())
-    ok &= len(signals) == len(F_INJ) and bool(
-        np.all(np.abs(signals - np.sort(F_INJ)) <= strong["dfreq"].max()),
-    )
-    return 0 if ok else 1
+    of_injection = groups[groups["detected"] & (groups["relation"].str.len() > 0)]
+    for row in of_injection[of_injection["relation"] != "1/1"].itertuples():
+        logger.info(
+            f"Detected {row.freq:.4f} Hz = {row.relation} x injection "
+            f"{INJECTIONS[row.injection]['freq']} Hz, S/N {row.score:.1f}",
+        )
+    false_alarms = groups[groups["detected"] & (groups["injection"] < 0)]
+    for row in false_alarms.itertuples():
+        logger.info(f"False alarm {row.freq:.4f} Hz, S/N {row.score:.1f}")
+    return 0 if results["recovered"].all() and false_alarms.empty else 1
 
 
 if __name__ == "__main__":
