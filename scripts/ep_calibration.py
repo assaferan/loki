@@ -149,8 +149,10 @@ def inject_pulsars(
 
     Each injection gives "freq" (Hz, at the first sample) and optionally "phase"
     (cycles) and "drift" (velocity derivatives, in the order of param_limits' drift
-    rows: highest order first). A pulse is on while
-    (phase + freq * (t + sum_k d_k t^(k+1) / ((k+1)! c))) mod 1 < duty. Under the
+    rows: highest order first). As in loki, the observed frequency is freq (1 - v / c)
+    for a line-of-sight velocity v away from us, so a positive acceleration lowers it
+    over time and a pulse is on while
+    (phase + freq * (t - sum_k d_k t^(k+1) / ((k+1)! c))) mod 1 < duty. Under the
     inverse-variance weighting of (ts_e, ts_v), a pulse of constant physical amplitude
     adds A * ts_v to ts_e, and A is set so that each train's ideal matched-filter S/N,
     A * sqrt(duty * (1 - duty) * sum(ts_v)), is snr.
@@ -164,7 +166,7 @@ def inject_pulsars(
         delay = t.copy()
         for i, d in enumerate(drift):
             order = len(drift) - i
-            delay += d * t ** (order + 1) / (math.factorial(order + 1) * speed_of_light)
+            delay -= d * t ** (order + 1) / (math.factorial(order + 1) * speed_of_light)
         phase = (inj.get("phase", 0.0) + inj["freq"] * delay) % 1.0
         out += amplitude * ts_v * (phase < duty)
     return out
