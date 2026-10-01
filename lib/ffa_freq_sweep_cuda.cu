@@ -74,9 +74,6 @@ public:
         m_scores_d.resize(planner_stats.get_max_scores_size());
         m_passing_indices_d.resize(planner_stats.get_max_scores_size());
 
-        // Copy scoring widths to device
-        m_widths_d = m_base_cfg.get_scoring_widths();
-
         // Log the actual memory usage for the allocated buffers
         spdlog::info("FFAFreqSweepCUDA allocated {:.2f} GB ({:.2f} GB buffers "
                      "+ {:.2f} GB coords + {:.2f} GB extra)",
@@ -261,6 +258,8 @@ private:
             nsegments, 1U,
             "FFAFreqSweepCUDA::execute_ffa_region: nsegments "
             "must be 1 to call scoring function");
+        // Copy this chunk's scoring widths to device
+        m_widths_d = cfg.get_scoring_widths();
         // Calculate available space in buffers
         const SizeType available_space =
             m_scores_d.size() - m_total_passing_scores;
@@ -290,14 +289,15 @@ private:
     float save_results(cands::FFAResultWriter& result_writer) {
         const auto n_params         = m_base_cfg.get_nparams();
         const SizeType total_params = n_params + 1;
-        const auto& scoring_widths  = m_base_cfg.get_scoring_widths();
-        const SizeType n_widths     = scoring_widths.size();
 
         float accumulated_flops        = 0.0F;
         SizeType global_passing_offset = 0; // Track cumulative offset
         const auto& ffa_regions_cfgs   = m_region_planner.get_cfgs();
         for (SizeType i = 0; i < ffa_regions_cfgs.size(); ++i) {
             const search::PulsarSearchConfig& cfg_cur = ffa_regions_cfgs[i];
+            // Scores are laid out with this chunk's widths
+            const auto& scoring_widths = cfg_cur.get_scoring_widths();
+            const SizeType n_widths    = scoring_widths.size();
             plans::FFAPlan<HostFoldT> ffa_plan(cfg_cur);
             const auto& param_limits = cfg_cur.get_param_limits();
             const auto& param_counts = ffa_plan.get_param_counts().back();
