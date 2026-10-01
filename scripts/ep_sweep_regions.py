@@ -36,6 +36,7 @@ from typing import Any
 import h5py
 import numpy as np
 import pandas as pd
+from scipy.constants import speed_of_light
 
 logger = logging.getLogger(__name__)
 
@@ -230,10 +231,12 @@ def load_candidates(paths: list[Path]) -> pd.DataFrame:
     pd.DataFrame
         One row per candidate: each parameter and its uncertainty (``d`` prefix),
         score, score_ep, and the region, chunk and run it came from. The observation
-        length is kept in ``attrs["tobs"]`` (s).
+        length (s) and the parameter names, frequency last, are kept in
+        ``attrs["tobs"]`` and ``attrs["param_names"]``.
     """
     frames = []
     tobs = None
+    names = []
     for region, path in enumerate(paths):
         with h5py.File(path, "r") as f:
             tobs = float(f.attrs["tobs"])
@@ -254,36 +257,101 @@ def load_candidates(paths: list[Path]) -> pd.DataFrame:
                     frames.append(run_frame)
     cands = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     cands.attrs["tobs"] = tobs
+    cands.attrs["param_names"] = names
     return cands
+
+
+def drift_ranges(cfg_kwargs: dict[str, Any]) -> list[tuple[int, float]]:
+    """Drift parameters searched by a config, as (order, width of range) pairs.
+
+    param_limits rows end with frequency; the row before it is the first derivative
+    of velocity (acceleration, order 1), the one before that the second (jerk, order
+    2), and so on.
+    """
+    rows = cfg_kwargs["param_limits"][:-1]
+    return [(len(rows) - i, hi - lo) for i, (lo, hi) in enumerate(rows)]
+
+
+def _observed_drift_ranges(cands: pd.DataFrame) -> list[tuple[int, float]]:
+    drifts = cands.attrs["param_names"][:-1]
+    return [
+        (len(drifts) - i, float(cands[name].max() - cands[name].min()))
+        for i, name in enumerate(drifts)
+    ]
+
+
+def freq_tolerance(
+    freq: float | np.ndarray,
+    tobs: float,
+    drifts: list[tuple[int, float]],
+) -> float | np.ndarray:
+    """Frequency spread (Hz) of one signal's candidates near ``freq``.
+
+    One resolution element, 1 / T, plus the largest change in apparent frequency over
+    the observation between drift trials across the searched ranges: a difference in
+    the order-k velocity derivative of width w shifts the frequency by up to
+    ``freq * w * T**k / (k! * c)``.
+    """
+    return 1 / tobs + sum(
+        freq * width * tobs**order / (math.factorial(order) * speed_of_light)
+        for order, width in drifts
+    )
+
+
+def _harmonic_ratio(
+    freq: float,
+    tol: float,
+    score: float,
+    parent_freq: float,
+    parent_tol: float,
+    parent_score: float,
+) -> Fraction | None:
+    """Simplest a/b with freq ~ a/b * parent_freq that the parent can explain.
+
+    For boxcar pulses, folding at a/b times a pulsar's frequency keeps at most
+    S/N / sqrt(a b). Scores are in units of their own noise, so allowing each one unit
+    of noise, only ratios with a b <= ((parent_score + 1) / (score - 1))**2 qualify;
+    a score within one unit of zero isn't attributed. The match tolerance adds both
+    frequencies' spreads.
+    """
+    if score <= 1:
+        return None
+    max_ab = math.floor(((parent_score + 1) / (score - 1)) ** 2)
+    b = np.arange(1, max_ab + 1)
+    a = np.rint(freq * b / parent_freq).astype(int)
+    r = a / b
+    ok = (
+        (a >= 1)
+        & (a != b)
+        & (np.gcd(a, b) == 1)
+        & (a * b <= max_ab)
+        & (np.abs(freq - r * parent_freq) <= tol + r * parent_tol)
+    )
+    if not ok.any():
+        return None
+    k = np.flatnonzero(ok)[np.argmin((a * b)[ok])]
+    return Fraction(int(a[k]), int(b[k]))
 
 
 def group_candidates(
     cands: pd.DataFrame,
     *,
-    freq_tol: float | None = None,
-    harmonic_tol: float | None = None,
-    max_harmonic: int = 4,
+    drifts: list[tuple[int, float]] | None = None,
 ) -> pd.DataFrame:
     """Collapse candidates into frequency groups and flag harmonically related ones.
 
-    A strong signal survives in many neighbouring trials. Candidates within
-    ``freq_tol`` of a neighbour in frequency form one group, represented by its best
-    candidate by score. A group is a harmonic when its frequency is a/b times that of
-    a stronger, independent group (a, b <= max_harmonic), to within
-    ``harmonic_tol * (1 + a/b)``.
+    A strong signal survives in many neighbouring trials. Candidates whose frequency
+    gap is within freq_tolerance form one group, represented by its best candidate by
+    score. A group is a harmonic when its frequency is a/b times that of a stronger,
+    independent group that can explain its score (see _harmonic_ratio).
 
     Parameters
     ----------
     cands : pd.DataFrame
         Candidates from load_candidates.
-    freq_tol : float | None, optional
-        Largest frequency gap (Hz) inside a group. Defaults to 40 / T, with T the
-        observation length: neighbouring trials of a signal at S/N ~15 can be ~25 / T
-        apart.
-    harmonic_tol : float | None, optional
-        Frequency tolerance (Hz) of a harmonic match. Defaults to 2 / T.
-    max_harmonic : int, optional
-        Largest numerator and denominator of the harmonic ratios tried.
+    drifts : list[tuple[int, float]] | None, optional
+        Searched drift ranges, as from drift_ranges(cfg_kwargs). Defaults to the
+        spread of the candidates' own drift parameters.
 
     Returns
     -------
@@ -294,15 +362,12 @@ def group_candidates(
     """
     if cands.empty:
         return cands.copy()
-    tobs = cands.attrs.get("tobs")
-    if (freq_tol is None or harmonic_tol is None) and tobs is None:
-        msg = "Pass freq_tol and harmonic_tol, or candidates from load_candidates"
-        raise ValueError(msg)
-    freq_tol = 40 / tobs if freq_tol is None else freq_tol
-    harmonic_tol = 2 / tobs if harmonic_tol is None else harmonic_tol
+    tobs = cands.attrs["tobs"]
+    drifts = _observed_drift_ranges(cands) if drifts is None else drifts
 
     by_freq = cands.sort_values("freq", ignore_index=True)
-    group_id = (by_freq["freq"].diff() > freq_tol).cumsum()
+    tol = freq_tolerance(by_freq["freq"], tobs, drifts)
+    group_id = (by_freq["freq"].diff() > tol).cumsum()
     spans = by_freq.groupby(group_id)["freq"].agg(["size", "min", "max"])
     groups = by_freq.loc[by_freq.groupby(group_id)["score"].idxmax()]
     groups = groups.assign(
@@ -311,29 +376,20 @@ def group_candidates(
         f_hi=spans["max"].to_numpy(),
     ).sort_values("score", ascending=False, ignore_index=True)
 
-    ratios = sorted(
-        {
-            Fraction(a, b)
-            for a in range(1, max_harmonic + 1)
-            for b in range(1, max_harmonic + 1)
-            if a != b
-        },
-    )
     harmonic_of = np.full(len(groups), np.nan)
     ratio = [""] * len(groups)
-    independent = []
-    for i, freq in enumerate(groups["freq"]):
+    independent = []  # (freq, tolerance, score) of each independent group so far
+    scores = groups["score"]
+    for i, (freq, score) in enumerate(zip(groups["freq"], scores, strict=True)):
+        tol_i = freq_tolerance(freq, tobs, drifts)
         for parent in independent:
-            match = next(
-                (r for r in ratios if abs(freq - r * parent) <= harmonic_tol * (1 + r)),
-                None,
-            )
+            match = _harmonic_ratio(freq, tol_i, score, *parent)
             if match is not None:
-                harmonic_of[i] = parent
+                harmonic_of[i] = parent[0]
                 ratio[i] = f"{match.numerator}/{match.denominator}"
                 break
         else:
-            independent.append(freq)
+            independent.append((freq, tol_i, score))
     return groups.assign(harmonic_of=harmonic_of, ratio=ratio)
 
 
