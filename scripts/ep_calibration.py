@@ -10,7 +10,8 @@
 ``fap`` is the false-alarm probability over the whole search and ``completeness`` the
 probability of reporting a pulsar whose S/N is ``snr_min``; both are the user's choice.
 injection_test injects pulsars into a time series, searches it with
-search_timeseries, and reports which were recovered.
+search_timeseries, and reports which were recovered. noise_trials measures the
+effective number of trials on noise-only searches, to check effective_trials.
 """
 
 from __future__ import annotations
@@ -23,9 +24,11 @@ import numpy as np
 import pandas as pd
 from ep_sweep_regions import (
     drift_ranges,
+    ep_sweep_by_region,
     freq_tolerance,
     harmonic_parent,
     harmonic_windows,
+    load_candidates,
     region_configs,
     search_timeseries,
 )
@@ -246,3 +249,55 @@ def injection_test(
             match[k] = found[0]
             relation[k] = f"{found[1].numerator}/{found[1].denominator}"
     return pd.DataFrame(rows), groups.assign(injection=match, relation=relation)
+
+
+def noise_trials(
+    cfg_kwargs: dict[str, Any],
+    n_realizations: int,
+    outdir: str | Path,
+    prefix: str,
+    *,
+    seed: int | None = None,
+    loki_site: str | Path | None = None,
+    sweep_kwargs: dict[str, Any] | None = None,
+) -> tuple[float, np.ndarray]:
+    """Measure a search's effective number of trials on noise-only series.
+
+    Searches n_realizations series of unit Gaussian noise (ts_v = 1) with the config
+    and takes each one's maximum candidate score. For a maximum over N independent
+    unit Gaussian trials, P(max <= m) = Phi(m)^N, so the maximum-likelihood N from
+    maxima m_i is n / -sum(log Phi(m_i)); -N log Phi(max) is exponentially
+    distributed, so its relative uncertainty is about 1 / sqrt(n). Unlike
+    effective_trials, this includes the pipeline's pruning. Pruning also hides noise
+    below the final thresholds, so use an snr_min low enough that every realization
+    keeps candidates, such as detection_threshold(effective_trials(cfg_kwargs), 1):
+    the S/N noise reaches about once in the search.
+
+    Returns
+    -------
+    tuple[float, np.ndarray]
+        The estimated number of trials, for detection_threshold, and the maxima.
+    """
+    rng = np.random.default_rng(seed)
+    nsamps = cfg_kwargs["nsamps"]
+    maxima = []
+    for i in range(n_realizations):
+        paths = ep_sweep_by_region(
+            rng.normal(size=nsamps),
+            np.ones(nsamps),
+            cfg_kwargs,
+            outdir,
+            f"{prefix}_{i:03d}",
+            loki_site=loki_site,
+            sweep_kwargs=sweep_kwargs,
+        )
+        cands = load_candidates(paths)
+        if cands.empty:
+            msg = (
+                f"Noise realization {i} kept no candidates, so its maximum is hidden "
+                "by pruning; lower snr_min for this calibration"
+            )
+            raise RuntimeError(msg)
+        maxima.append(cands["score"].max())
+    maxima = np.asarray(maxima, dtype=np.float64)
+    return float(len(maxima) / -norm.logcdf(maxima).sum()), maxima
