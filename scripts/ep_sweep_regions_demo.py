@@ -54,7 +54,8 @@ CFG = {
     "bseg_ffa": NSAMPS // 8,
     "prune_poly_order": 2,
 }
-SWEEP = {"show_progress": False, "n_runs": 1, "ref_segs": [4]}
+# One EP run, from the first segment (n_runs takes precedence over any ref_segs)
+SWEEP = {"show_progress": False, "n_runs": 1}
 
 
 def main(outdir: Path) -> int:
