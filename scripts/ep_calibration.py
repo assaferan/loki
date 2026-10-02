@@ -148,10 +148,10 @@ def inject_pulsars(
     """Return a copy of ts_e with boxcar pulse trains added.
 
     Each injection gives "freq" (Hz, at the first sample) and optionally "phase"
-    (cycles) and "drift" (velocity derivatives, in the order of param_limits' drift
-    rows: highest order first). As in loki, the observed frequency is freq (1 - v / c)
-    for a line-of-sight velocity v away from us, so a positive acceleration lowers it
-    over time and a pulse is on while
+    (cycles), "drift" (velocity derivatives, in the order of param_limits' drift
+    rows: highest order first) and "snr" (in place of snr). As in loki, the observed
+    frequency is freq (1 - v / c) for a line-of-sight velocity v away from us, so a
+    positive acceleration lowers it over time and a pulse is on while
     (phase + freq * (t - sum_k d_k t^(k+1) / ((k+1)! c))) mod 1 < duty. Under the
     inverse-variance weighting of (ts_e, ts_v), a pulse of constant physical amplitude
     adds A * ts_v to ts_e, and A is set so that each train's ideal matched-filter S/N,
@@ -159,7 +159,7 @@ def inject_pulsars(
     """
     ts_v = np.asarray(ts_v, dtype=np.float64)
     t = np.arange(len(ts_e)) * tsamp
-    amplitude = snr / math.sqrt(duty * (1 - duty) * ts_v.sum())
+    ideal_snr_per_amplitude = math.sqrt(duty * (1 - duty) * ts_v.sum())
     out = np.array(ts_e, dtype=np.float64)
     for inj in injections:
         drift = inj.get("drift", ())
@@ -168,6 +168,7 @@ def inject_pulsars(
             order = len(drift) - i
             delay -= d * t ** (order + 1) / (math.factorial(order + 1) * speed_of_light)
         phase = (inj.get("phase", 0.0) + inj["freq"] * delay) % 1.0
+        amplitude = inj.get("snr", snr) / ideal_snr_per_amplitude
         out += amplitude * ts_v * (phase < duty)
     return out
 
@@ -191,9 +192,9 @@ def injection_test(
     An injection is recovered when a detected group (search_timeseries) lies within
     freq_tolerance of its frequency. A detected group can also be a harmonic of an
     injection, if harmonic_parent can tell it from chance and its S/N is possible for
-    a harmonic of the injected S/N, with p_max = 1 / (number of detected groups).
-    Detected groups that are neither are false alarms, or real signals already in the
-    data.
+    a harmonic of the injection's S/N (its "snr", or snr), with
+    p_max = 1 / (number of detected groups). Detected groups that are neither are
+    false alarms, or real signals already in the data.
 
     Returns
     -------
@@ -242,6 +243,7 @@ def injection_test(
         )
     band = tuple(cfg_kwargs["param_limits"][-1])
     p_max = 1 / max(int(groups["detected"].sum()), 1)
+    injected_snrs = [inj.get("snr", snr) for inj in injections]
     windows = [
         harmonic_windows(
             inj["freq"],
@@ -249,10 +251,10 @@ def injection_test(
             drifts=drifts,
             band=band,
             p_max=p_max,
-            parent_score=snr,
+            parent_score=inj_snr,
             snr_threshold=snr_threshold,
         )
-        for inj in injections
+        for inj, inj_snr in zip(injections, injected_snrs, strict=True)
     ]
     for k in np.flatnonzero(groups["detected"].to_numpy() & (match < 0)):
         found = harmonic_parent(
@@ -261,7 +263,7 @@ def injection_test(
             band=band,
             p_max=p_max,
             score=groups["score"].iloc[k],
-            parent_scores=[snr] * len(injections),
+            parent_scores=injected_snrs,
             snr_threshold=snr_threshold,
         )
         if found is not None:
