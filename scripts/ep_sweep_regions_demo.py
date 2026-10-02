@@ -4,7 +4,9 @@
 Injects one pulsar into each of two coarse regions with different nbins, in Gaussian
 noise, searches with a threshold set by a false-alarm probability over the trials
 measured on noise-only searches, and exits non-zero unless both pulsars are detected,
-nothing else is, and their harmonics are flagged.
+nothing else is, and their harmonics are flagged. Then, in a longer series, injects a
+bright pulsar next to a weak one: both must be detected, and the search itself must
+flag every harmonic.
 
 Build this branch first, e.g. from the repository root with
 ``pip install --no-build-isolation --no-deps --target build/site .``; the demo imports
@@ -18,6 +20,7 @@ from __future__ import annotations
 import logging
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from ep_calibration import (
@@ -26,6 +29,9 @@ from ep_calibration import (
     injection_test,
     noise_trials,
 )
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -60,14 +66,31 @@ CFG = {
 # One EP run from each segment as the reference: a pulsar lost from one can survive
 # from another (n_runs takes precedence over any ref_segs)
 SWEEP = {"show_progress": False, "n_runs": NSEGMENTS}
+# A bright pulsar's harmonics clear the threshold at many ratios, among many weaker
+# groups below it; much brighter ones also show aliases of it that no harmonic test
+# explains. Harmonic windows narrow as 1 / T, so this case observes for longer.
+BRIGHT_NSAMPS = 2**23
+BRIGHT_CFG = {**CFG, "nsamps": BRIGHT_NSAMPS, "bseg_ffa": BRIGHT_NSAMPS // NSEGMENTS}
+BRIGHT_INJECTIONS = [
+    {"freq": 85.0, "drift": [-6.0], "phase": 0.3, "snr": 110.0},
+    # Far from every window of the bright pulsar's harmonics: must not be absorbed
+    {"freq": 166.0, "phase": 0.6},
+]
 
 
-def main(outdir: Path) -> int:
+def search_case(
+    cfg_kwargs: dict[str, Any],
+    injections: list[dict[str, Any]],
+    outdir: Path,
+    prefix: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Inject into Gaussian noise, search, and log what is found (injection_test)."""
     rng = np.random.default_rng(SEED)
-    ts_e = rng.normal(size=NSAMPS)
-    ts_v = np.ones(NSAMPS)
+    ts_e = rng.normal(size=cfg_kwargs["nsamps"])
+    ts_v = np.ones(cfg_kwargs["nsamps"])
     # A threshold scheme designed where noise peaks once keeps pulsars at the threshold
-    cfg = {**CFG, "snr_min": detection_threshold(effective_trials(CFG), 1)}
+    snr_min = detection_threshold(effective_trials(cfg_kwargs), 1)
+    cfg = {**cfg_kwargs, "snr_min": snr_min}
     site = Path(__file__).resolve().parents[1] / "build" / "site"
     loki_site = site if site.is_dir() else None
     # effective_trials counts neither pruning nor the runs from several segments
@@ -75,7 +98,7 @@ def main(outdir: Path) -> int:
         cfg,
         N_NOISE,
         outdir,
-        "noise",
+        f"{prefix}_noise",
         seed=NOISE_SEED,
         loki_site=loki_site,
         sweep_kwargs=SWEEP,
@@ -89,9 +112,9 @@ def main(outdir: Path) -> int:
         ts_e,
         ts_v,
         cfg,
-        INJECTIONS,
+        injections,
         outdir,
-        "demo",
+        prefix,
         duty=DUTY,
         snr=INJECTED_SNR,
         snr_threshold=snr_threshold,
@@ -117,12 +140,22 @@ def main(outdir: Path) -> int:
     for row in of_injection[of_injection["relation"] != "1/1"].itertuples():
         logger.info(
             f"Detected {row.freq:.4f} Hz = {row.relation} x injection "
-            f"{INJECTIONS[row.injection]['freq']} Hz, S/N {row.score:.1f}",
+            f"{injections[row.injection]['freq']} Hz, S/N {row.score:.1f}",
         )
-    false_alarms = groups[groups["detected"] & (groups["injection"] < 0)]
-    for row in false_alarms.itertuples():
+    for row in groups[groups["detected"] & (groups["injection"] < 0)].itertuples():
         logger.info(f"False alarm {row.freq:.4f} Hz, S/N {row.score:.1f}")
-    return 0 if results["recovered"].all() and false_alarms.empty else 1
+    return results, groups
+
+
+def main(outdir: Path) -> int:
+    results, groups = search_case(CFG, INJECTIONS, outdir, "demo")
+    false_alarms = groups["detected"] & (groups["injection"] < 0)
+    regions_ok = results["recovered"].all() and not false_alarms.any()
+    results, groups = search_case(BRIGHT_CFG, BRIGHT_INJECTIONS, outdir, "bright")
+    # Detected groups other than the injections: unflagged harmonics or false alarms
+    others = groups["detected"] & (groups["relation"] != "1/1")
+    bright_ok = results["recovered"].all() and not others.any()
+    return 0 if regions_ok and bright_ok else 1
 
 
 if __name__ == "__main__":
