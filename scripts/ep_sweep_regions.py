@@ -338,8 +338,8 @@ def harmonic_windows(
     level_max = math.inf
     if parent_score is not None and snr_threshold is not None:
         min_fraction = snr_threshold / parent_score
-        # 1 / sqrt(a b) or 1 / b >= min_fraction, with a / b <= f_hi / parent_freq
-        level_max = max(1.0, f_hi / parent_freq) / min_fraction**2
+        # 1 / min(a, b) >= min_fraction, with a / b in [f_lo, f_hi] / parent_freq
+        level_max = max(parent_freq / f_lo, f_hi / parent_freq) / min_fraction**2
     levels: dict[int, list[tuple[Fraction, float, float]]] = {}
     chance = 0.0
     level = 1
@@ -362,15 +362,19 @@ def harmonic_snr_fraction(ratio: Fraction) -> float:
     """Largest fraction of a parent's measured S/N that its a/b harmonic can show.
 
     Folding a boxcar pulsar of duty d at a/b times its frequency shows b pulses of
-    duty (a/b) d with 1/b of the signal each: at most 1 / sqrt(a b) of its true S/N.
-    Both folds also lose S/N to the search's phase tolerance, the same fraction s of a
-    cycle in every region, keeping sqrt(d / (d + s)) of the fundamental and
+    duty (a/b) d with 1/b of the signal each: 1 / sqrt(a b) of its true S/N while a
+    boxcar trial covers one. Trials stop at a widest duty (ducy_max), and a narrower
+    boxcar keeps sqrt(width / duty) of a pulse. A pulse wider than that loses S/N in
+    the fundamental's fold but less in a subharmonic's (a < b), where it is narrower:
+    there the harmonic shows up to 1 / a of the fundamental's measured S/N. Both folds
+    also lose S/N to the search's phase tolerance, the same fraction s of a cycle in
+    every region, keeping sqrt(d / (d + s)) of the fundamental and
     sqrt((a/b) d / ((a/b) d + s)) of the harmonic. That ratio is at most sqrt(a/b)
     when a > b and at most 1 otherwise, whatever d: so the harmonic shows at most the
-    parent's measured S/N times 1/b (a > b) or 1 / sqrt(a b) (a < b).
+    parent's measured S/N times 1/b (a > b) or 1/a (a < b).
     """
     a, b = ratio.numerator, ratio.denominator
-    return 1 / b if a > b else 1 / math.sqrt(a * b)
+    return 1 / min(a, b)
 
 
 def harmonic_parent(
