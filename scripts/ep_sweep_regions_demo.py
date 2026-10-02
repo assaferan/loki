@@ -19,12 +19,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
-from ep_calibration import (
-    detection_threshold,
-    effective_trials,
-    injection_test,
-    target_snr,
-)
+from ep_calibration import detection_threshold, effective_trials, injection_test
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +27,6 @@ SEED = 1  # noise realization
 NSAMPS = 2**16
 TSAMP = 64e-6
 FAP = 1e-3  # false-alarm probability over the whole search
-COMPLETENESS = 0.9  # for a pulsar at snr_min
 # One pulsar per region: [100, 200] Hz folds with 32 bins, [50, 100] Hz with 64
 INJECTIONS = [{"freq": 120.0}, {"freq": 70.0}]
 DUTY = 0.05
@@ -64,7 +58,8 @@ def main(outdir: Path) -> int:
     ts_v = np.ones(NSAMPS)
     n_eff = effective_trials(CFG)
     snr_threshold = detection_threshold(n_eff, FAP)
-    cfg = {**CFG, "snr_min": target_snr(snr_threshold, COMPLETENESS)}
+    # A threshold scheme designed where noise peaks once keeps pulsars at the threshold
+    cfg = {**CFG, "snr_min": detection_threshold(n_eff, 1)}
     logger.info(
         f"N_eff {n_eff:.3g}: threshold {snr_threshold:.2f} at FAP {FAP}, "
         f"snr_min {cfg['snr_min']:.2f}",

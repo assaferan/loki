@@ -1,17 +1,21 @@
 # ruff: noqa: INP001
 """Detection thresholds for EPFreqSweep searches, from the size of the search.
 
-    from ep_calibration import detection_threshold, effective_trials, target_snr
+    from ep_calibration import detection_threshold, effective_trials
 
     n_eff = effective_trials(cfg_kwargs)
     snr_threshold = detection_threshold(n_eff, fap)  # report groups above this
-    snr_min = target_snr(snr_threshold, completeness)  # use as cfg_kwargs["snr_min"]
+    cfg_kwargs["snr_min"] = detection_threshold(n_eff, 1)  # where noise peaks once
 
-``fap`` is the false-alarm probability over the whole search and ``completeness`` the
-probability of reporting a pulsar whose S/N is ``snr_min``; both are the user's choice.
-injection_test injects pulsars into a time series, searches it with
-search_timeseries, and reports which were recovered. noise_trials measures the
-effective number of trials on noise-only searches, to check effective_trials.
+``fap`` is the false-alarm probability over the whole search, the user's choice.
+snr_min only designs EP's threshold scheme, which keeps a pulsar at snr_min a fraction
+of the time and one a few S/N above it most of the time: designed where noise peaks
+about once, it keeps pulsars at snr_threshold, and noise_trials can measure the trials
+with the search's own pruning. target_snr(snr_threshold, completeness) is the S/N of a
+pulsar reported with probability completeness. injection_test injects pulsars into a
+time series, searches it with search_timeseries, and reports which were recovered.
+noise_trials measures the effective number of trials on noise-only searches, to check
+effective_trials.
 """
 
 from __future__ import annotations
