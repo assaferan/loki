@@ -433,9 +433,10 @@ def group_candidates(
     gap is within freq_tolerance form one group, represented by its best candidate by
     score. Going from the strongest group down, a group is a harmonic of a stronger,
     independent group when harmonic_parent can tell it from chance, with
-    p_max = 1 / (number of groups): fewer than one chance attribution expected over
-    the whole list. Given snr_threshold, the match must also be possible in S/N, and a
-    parent only has windows at ratios whose harmonic can reach snr_threshold.
+    p_max = 1 / (number of groups the search could report: those at or above
+    snr_threshold, or all of them without it): fewer than one chance attribution
+    expected among them. Given snr_threshold, the match must also be possible in S/N,
+    and a parent only has windows at ratios whose harmonic can reach snr_threshold.
 
     Parameters
     ----------
@@ -474,7 +475,12 @@ def group_candidates(
         f_hi=spans["max"].to_numpy(),
     ).sort_values("score", ascending=False, ignore_index=True)
 
-    p_max = 1 / len(groups)
+    reportable = (
+        len(groups)
+        if snr_threshold is None
+        else int((groups["score"] >= snr_threshold).sum())
+    )
+    p_max = 1 / max(reportable, 1)
     harmonic_of = np.full(len(groups), np.nan)
     ratio = [""] * len(groups)
     parent_freqs: list[float] = []  # independent groups so far, strongest first
