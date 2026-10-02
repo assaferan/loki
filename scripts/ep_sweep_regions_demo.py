@@ -2,8 +2,9 @@
 """Synthetic injection test of the region-by-region EP search.
 
 Injects one pulsar into each of two coarse regions with different nbins, in Gaussian
-noise, searches with a threshold set by a false-alarm probability, and exits non-zero
-unless both pulsars are detected, nothing else is, and their harmonics are flagged.
+noise, searches with a threshold set by a false-alarm probability over the trials
+measured on noise-only searches, and exits non-zero unless both pulsars are detected,
+nothing else is, and their harmonics are flagged.
 
 Build this branch first, e.g. from the repository root with
 ``pip install --no-build-isolation --no-deps --target build/site .``; the demo imports
@@ -19,13 +20,21 @@ import sys
 from pathlib import Path
 
 import numpy as np
-from ep_calibration import detection_threshold, effective_trials, injection_test
+from ep_calibration import (
+    detection_threshold,
+    effective_trials,
+    injection_test,
+    noise_trials,
+)
 
 logger = logging.getLogger(__name__)
 
 SEED = 1  # noise realization
+NOISE_SEED = 2  # noise-only realizations that measure the trials
+N_NOISE = 8  # noise-only searches: N_eff to about 1 / sqrt(8)
 NSAMPS = 2**16
 TSAMP = 64e-6
+NSEGMENTS = 8  # EP segments
 FAP = 1e-3  # false-alarm probability over the whole search
 # One pulsar per region: [100, 200] Hz folds with 32 bins, [50, 100] Hz with 64
 INJECTIONS = [{"freq": 120.0}, {"freq": 70.0}]
@@ -45,26 +54,37 @@ CFG = {
     "octave_scale": 2.0,
     "nbins_max": 1024,
     "bseg_brute": 1024,
-    "bseg_ffa": NSAMPS // 8,
+    "bseg_ffa": NSAMPS // NSEGMENTS,
     "prune_poly_order": 2,
 }
-# One EP run, from the first segment (n_runs takes precedence over any ref_segs)
-SWEEP = {"show_progress": False, "n_runs": 1}
+# One EP run from each segment as the reference: a pulsar lost from one can survive
+# from another (n_runs takes precedence over any ref_segs)
+SWEEP = {"show_progress": False, "n_runs": NSEGMENTS}
 
 
 def main(outdir: Path) -> int:
     rng = np.random.default_rng(SEED)
     ts_e = rng.normal(size=NSAMPS)
     ts_v = np.ones(NSAMPS)
-    n_eff = effective_trials(CFG)
-    snr_threshold = detection_threshold(n_eff, FAP)
     # A threshold scheme designed where noise peaks once keeps pulsars at the threshold
-    cfg = {**CFG, "snr_min": detection_threshold(n_eff, 1)}
+    cfg = {**CFG, "snr_min": detection_threshold(effective_trials(CFG), 1)}
+    site = Path(__file__).resolve().parents[1] / "build" / "site"
+    loki_site = site if site.is_dir() else None
+    # effective_trials counts neither pruning nor the runs from several segments
+    n_eff, _ = noise_trials(
+        cfg,
+        N_NOISE,
+        outdir,
+        "noise",
+        seed=NOISE_SEED,
+        loki_site=loki_site,
+        sweep_kwargs=SWEEP,
+    )
+    snr_threshold = detection_threshold(n_eff, FAP)
     logger.info(
         f"N_eff {n_eff:.3g}: threshold {snr_threshold:.2f} at FAP {FAP}, "
         f"snr_min {cfg['snr_min']:.2f}",
     )
-    site = Path(__file__).resolve().parents[1] / "build" / "site"
     results, groups = injection_test(
         ts_e,
         ts_v,
@@ -75,7 +95,7 @@ def main(outdir: Path) -> int:
         duty=DUTY,
         snr=INJECTED_SNR,
         snr_threshold=snr_threshold,
-        loki_site=site if site.is_dir() else None,
+        loki_site=loki_site,
         sweep_kwargs=SWEEP,
     )
     for row in results.itertuples():
