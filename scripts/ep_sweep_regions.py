@@ -311,15 +311,21 @@ def harmonic_windows(
     drifts: list[tuple[int, float]],
     band: tuple[float, float],
     p_max: float,
+    parent_score: float | None = None,
+    snr_threshold: float | None = None,
 ) -> dict[int, list[tuple[Fraction, float, float]]]:
     """Harmonic windows of parent_freq, by ratio complexity.
 
     Ratios a/b (coprime, a != b) inside the band, each with the window
     |freq - a/b parent_freq| <= freq_tolerance(a/b parent_freq) + a/b
-    freq_tolerance(parent_freq), grouped by their complexity a b. An unrelated
-    frequency, uniform over the band, falls in a given window with probability its
-    width over the band's. Levels are added until this parent's windows alone exceed
-    p_max: no match beyond that level can count (see harmonic_parent).
+    freq_tolerance(parent_freq), grouped by their complexity a b. Given parent_score
+    and snr_threshold, only ratios whose harmonic can reach the threshold on its own,
+    harmonic_snr_fraction(a/b) parent_score >= snr_threshold, get a window: only those
+    can explain a group the search reports, and a parent below the threshold has
+    none. An unrelated frequency, uniform over the band, falls in a given window with
+    probability its width over the band's. Levels are added until this parent's
+    windows alone exceed p_max, or no further ratio can reach the threshold: no match
+    beyond that level can count (see harmonic_parent).
 
     Returns
     -------
@@ -328,19 +334,26 @@ def harmonic_windows(
     """
     f_lo, f_hi = band
     tol_parent = freq_tolerance(parent_freq, tobs, drifts)
+    min_fraction = 0.0
+    level_max = math.inf
+    if parent_score is not None and snr_threshold is not None:
+        min_fraction = snr_threshold / parent_score
+        # 1 / sqrt(a b) or 1 / b >= min_fraction, with a / b <= f_hi / parent_freq
+        level_max = max(1.0, f_hi / parent_freq) / min_fraction**2
     levels: dict[int, list[tuple[Fraction, float, float]]] = {}
     chance = 0.0
     level = 1
-    while chance <= p_max:
+    while chance <= p_max and level < level_max:
         level += 1
         for a in range(1, level + 1):
             b, rem = divmod(level, a)
             if rem or a == b or math.gcd(a, b) != 1:
                 continue
+            ratio = Fraction(a, b)
             target = a * parent_freq / b
-            if f_lo <= target <= f_hi:
+            if f_lo <= target <= f_hi and harmonic_snr_fraction(ratio) >= min_fraction:
                 half = freq_tolerance(target, tobs, drifts) + a / b * tol_parent
-                levels.setdefault(level, []).append((Fraction(a, b), target, half))
+                levels.setdefault(level, []).append((ratio, target, half))
                 chance += 2 * half / (f_hi - f_lo)
     return levels
 
@@ -421,7 +434,8 @@ def group_candidates(
     score. Going from the strongest group down, a group is a harmonic of a stronger,
     independent group when harmonic_parent can tell it from chance, with
     p_max = 1 / (number of groups): fewer than one chance attribution expected over
-    the whole list. Given snr_threshold, the match must also be possible in S/N.
+    the whole list. Given snr_threshold, the match must also be possible in S/N, and a
+    parent only has windows at ratios whose harmonic can reach snr_threshold.
 
     Parameters
     ----------
@@ -491,6 +505,8 @@ def group_candidates(
                     drifts=drifts,
                     band=band,
                     p_max=p_max,
+                    parent_score=score,
+                    snr_threshold=snr_threshold,
                 ),
             )
     return groups.assign(harmonic_of=harmonic_of, ratio=ratio)

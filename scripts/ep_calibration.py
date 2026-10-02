@@ -243,7 +243,15 @@ def injection_test(
     band = tuple(cfg_kwargs["param_limits"][-1])
     p_max = 1 / max(int(groups["detected"].sum()), 1)
     windows = [
-        harmonic_windows(inj["freq"], tobs=tobs, drifts=drifts, band=band, p_max=p_max)
+        harmonic_windows(
+            inj["freq"],
+            tobs=tobs,
+            drifts=drifts,
+            band=band,
+            p_max=p_max,
+            parent_score=snr,
+            snr_threshold=snr_threshold,
+        )
         for inj in injections
     ]
     for k in np.flatnonzero(groups["detected"].to_numpy() & (match < 0)):
