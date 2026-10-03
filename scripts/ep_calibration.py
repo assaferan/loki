@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import pandas as pd
 from ep_sweep_regions import (
+    box_widths,
     drift_ranges,
     ep_sweep_by_region,
     freq_tolerance,
@@ -41,18 +42,6 @@ from scipy.stats import norm
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-
-def box_widths(nbins: int, ducy_max: float, wtsp: float) -> list[int]:
-    """Boxcar widths (bins) loki scores a fold with: generate_box_width_trials."""
-    wmax = int(max(1.0, ducy_max * nbins))
-    widths = [1]
-    while widths[-1] < wmax:
-        next_width = max(widths[-1] + 1, int(wtsp * widths[-1]))
-        if next_width > wmax:
-            break
-        widths.append(next_width)
-    return widths
 
 
 def _drift_cells_integral(

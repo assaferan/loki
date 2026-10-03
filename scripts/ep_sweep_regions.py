@@ -548,6 +548,18 @@ def flag_harmonics(
     return groups.assign(harmonic_of=harmonic_of, ratio=ratio)
 
 
+def box_widths(nbins: int, ducy_max: float, wtsp: float) -> list[int]:
+    """Boxcar widths (bins) loki scores a fold with: generate_box_width_trials."""
+    wmax = int(max(1.0, ducy_max * nbins))
+    widths = [1]
+    while widths[-1] < wmax:
+        next_width = max(widths[-1] + 1, int(wtsp * widths[-1]))
+        if next_width > wmax:
+            break
+        widths.append(next_width)
+    return widths
+
+
 def search_timeseries(
     ts_e: np.ndarray,
     ts_v: np.ndarray,
