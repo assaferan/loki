@@ -3,10 +3,11 @@
 
 Injects one pulsar into each of two coarse regions with different nbins, in Gaussian
 noise, searches with a threshold set by a false-alarm probability over the trials
-measured on noise-only searches, and exits non-zero unless both pulsars are detected,
-nothing else is, and their harmonics are flagged. Then, in a longer series, injects a
-bright pulsar next to a weak one: both must be detected, and the search itself must
-flag every harmonic.
+measured on noise-only searches, confirms detections by exact folds, and exits
+non-zero unless both pulsars are detected, nothing else is, and their harmonics are
+flagged. Then, in a longer series, injects a bright pulsar next to a weak one: both
+must be detected, and the search itself must flag every harmonic and reject every
+alias.
 
 Build this branch first, e.g. from the repository root with
 ``pip install --no-build-isolation --no-deps --target build/site .``; the demo imports
@@ -67,12 +68,12 @@ CFG = {
 # from another (n_runs takes precedence over any ref_segs)
 SWEEP = {"show_progress": False, "n_runs": NSEGMENTS}
 # A bright pulsar's harmonics clear the threshold at many ratios, among many weaker
-# groups below it; much brighter ones also show aliases of it that no harmonic test
-# explains. Harmonic windows narrow as 1 / T, so this case observes for longer.
+# groups below it, and the FFA leaks a few percent of its S/N into aliases that only
+# exact folds reject. Harmonic windows narrow as 1 / T, so this case observes longer.
 BRIGHT_NSAMPS = 2**23
 BRIGHT_CFG = {**CFG, "nsamps": BRIGHT_NSAMPS, "bseg_ffa": BRIGHT_NSAMPS // NSEGMENTS}
 BRIGHT_INJECTIONS = [
-    {"freq": 85.0, "drift": [-6.0], "phase": 0.3, "snr": 110.0},
+    {"freq": 85.0, "drift": [-6.0], "phase": 0.3, "snr": 400.0},
     # Far from every window of the bright pulsar's harmonics: must not be absorbed
     {"freq": 166.0, "phase": 0.6},
 ]
@@ -118,6 +119,7 @@ def search_case(
         duty=DUTY,
         snr=INJECTED_SNR,
         snr_threshold=snr_threshold,
+        confirm_fap=FAP,
         loki_site=loki_site,
         sweep_kwargs=SWEEP,
     )
@@ -128,6 +130,8 @@ def search_case(
             else "NOT recovered"
         )
         logger.info(f"Injected {row.freq} Hz: {found}")
+    rejected = (groups["score"] >= snr_threshold) & ~groups["confirmed"]
+    logger.info(f"Exact folds rejected {int(rejected.sum())} groups above threshold")
     # Above the threshold, the search itself flags harmonics of stronger groups;
     # the injection test also explains detections at harmonics of an injection
     flagged = groups[(groups["score"] >= snr_threshold) & groups["harmonic_of"].notna()]
