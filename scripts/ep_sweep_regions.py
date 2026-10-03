@@ -435,12 +435,7 @@ def group_candidates(
 
     A strong signal survives in many neighbouring trials. Candidates whose frequency
     gap is within freq_tolerance form one group, represented by its best candidate by
-    score. Going from the strongest group down, a group is a harmonic of a stronger,
-    independent group when harmonic_parent can tell it from chance, with
-    p_max = 1 / (number of groups the search could report: those at or above
-    snr_threshold, or all of them without it): fewer than one chance attribution
-    expected among them. Given snr_threshold, the match must also be possible in S/N,
-    and a parent only has windows at ratios whose harmonic can reach snr_threshold.
+    score; flag_harmonics then flags the groups that are harmonics of others.
 
     Parameters
     ----------
@@ -459,8 +454,7 @@ def group_candidates(
     -------
     pd.DataFrame
         One row per group, strongest first: the best candidate's columns, plus n (the
-        group's size), f_lo and f_hi (its frequency span), harmonic_of (the frequency
-        of the group it is a harmonic of, NaN if independent) and ratio ("a/b").
+        group's size), f_lo and f_hi (its frequency span), and flag_harmonics' columns.
     """
     if cands.empty:
         return cands.copy()
@@ -477,8 +471,40 @@ def group_candidates(
         n=spans["size"].to_numpy(),
         f_lo=spans["min"].to_numpy(),
         f_hi=spans["max"].to_numpy(),
-    ).sort_values("score", ascending=False, ignore_index=True)
+    )
+    return flag_harmonics(
+        groups,
+        tobs=tobs,
+        drifts=drifts,
+        band=band,
+        snr_threshold=snr_threshold,
+    )
 
+
+def flag_harmonics(
+    groups: pd.DataFrame,
+    *,
+    tobs: float,
+    drifts: list[tuple[int, float]],
+    band: tuple[float, float],
+    snr_threshold: float | None = None,
+) -> pd.DataFrame:
+    """Flag the groups that are harmonics of stronger, independent ones.
+
+    Going from the strongest group down, a group is a harmonic of a stronger,
+    independent group when harmonic_parent can tell it from chance, with
+    p_max = 1 / (number of groups the search could report: those at or above
+    snr_threshold, or all of them without it): fewer than one chance attribution
+    expected among them. Given snr_threshold, the match must also be possible in S/N,
+    and a parent only has windows at ratios whose harmonic can reach snr_threshold.
+
+    Returns
+    -------
+    pd.DataFrame
+        The groups, strongest first, with harmonic_of (the frequency of the group each
+        is a harmonic of, NaN if independent) and ratio ("a/b").
+    """
+    groups = groups.sort_values("score", ascending=False, ignore_index=True)
     reportable = (
         len(groups)
         if snr_threshold is None
