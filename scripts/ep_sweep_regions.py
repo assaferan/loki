@@ -37,6 +37,7 @@ import h5py
 import numpy as np
 import pandas as pd
 from scipy.constants import speed_of_light
+from scipy.stats import norm
 
 logger = logging.getLogger(__name__)
 
@@ -647,6 +648,7 @@ def search_timeseries(
     prefix: str,
     *,
     snr_threshold: float,
+    confirm_fap: float | None = None,
     loki_site: str | Path | None = None,
     sweep_kwargs: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
@@ -656,10 +658,20 @@ def search_timeseries(
     and marks as detected each independent group (not a harmonic of a stronger one)
     whose score reaches snr_threshold (see ep_calibration.detection_threshold).
 
+    Given confirm_fap, each group reaching snr_threshold is also folded exactly
+    (refold_snr), which turns the FFA's leaks of strong signals back into noise. It
+    stays reportable if its fold reaches the S/N noise reaches with probability
+    confirm_fap over the trials of all these folds (phase bins times boxcar widths
+    each); a real signal's exact fold can score below its search score, which picks
+    the best of many nearby phase paths. Groups that fail are neither detected nor
+    anyone's parent.
+
     Returns
     -------
     pd.DataFrame
-        group_candidates' groups, strongest first, with a boolean "detected" column.
+        group_candidates' groups, strongest first, with a boolean "detected" column;
+        given confirm_fap, also score_fold (the exact fold's S/N, NaN below
+        snr_threshold) and confirmed.
     """
     paths = ep_sweep_by_region(
         ts_e,
@@ -670,17 +682,52 @@ def search_timeseries(
         loki_site=loki_site,
         sweep_kwargs=sweep_kwargs,
     )
+    cands = load_candidates(paths)
+    drifts = drift_ranges(cfg_kwargs)
+    band = tuple(cfg_kwargs["param_limits"][-1])
     groups = group_candidates(
-        load_candidates(paths),
-        drifts=drift_ranges(cfg_kwargs),
-        band=tuple(cfg_kwargs["param_limits"][-1]),
+        cands,
+        drifts=drifts,
+        band=band,
         snr_threshold=snr_threshold,
     )
     if groups.empty:
         return groups.assign(detected=pd.Series(dtype=bool))
-    return groups.assign(
-        detected=(groups["score"] >= snr_threshold) & groups["harmonic_of"].isna(),
-    )
+    reportable = groups["score"] >= snr_threshold
+    if confirm_fap is not None:
+        above = groups[reportable]
+        above.attrs = cands.attrs
+        score_fold = np.full(len(groups), np.nan)
+        confirmed = np.zeros(len(groups), dtype=bool)
+        if not above.empty:
+            trials = sum(
+                nbins
+                * len(box_widths(nbins, cfg_kwargs["ducy_max"], cfg_kwargs["wtsp"]))
+                for nbins in fold_nbins(cfg_kwargs, above["freq"].to_numpy())
+            )
+            # As ep_calibration.detection_threshold(trials, confirm_fap)
+            confirm_snr = norm.isf(confirm_fap / trials)
+            score_fold[reportable.to_numpy()] = refold_snr(
+                ts_e,
+                ts_v,
+                cfg_kwargs,
+                above,
+            )
+            confirmed = score_fold >= confirm_snr
+        groups = groups.assign(score_fold=score_fold, confirmed=confirmed)
+        rejected = reportable & ~groups["confirmed"]
+        flagged = flag_harmonics(
+            groups[~rejected].drop(columns=["harmonic_of", "ratio"]),
+            tobs=cands.attrs["tobs"],
+            drifts=drifts,
+            band=band,
+            snr_threshold=snr_threshold,
+        )
+        groups = pd.concat(
+            [flagged, groups[rejected].assign(harmonic_of=np.nan, ratio="")],
+        ).sort_values("score", ascending=False, ignore_index=True)
+        reportable = groups["confirmed"]
+    return groups.assign(detected=reportable & groups["harmonic_of"].isna())
 
 
 def _run_region(spec_path: str) -> None:

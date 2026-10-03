@@ -177,6 +177,7 @@ def injection_test(
     duty: float,
     snr: float,
     snr_threshold: float,
+    confirm_fap: float | None = None,
     loki_site: str | Path | None = None,
     sweep_kwargs: dict[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -187,7 +188,8 @@ def injection_test(
     injection, if harmonic_parent can tell it from chance and its S/N is possible for
     a harmonic of the injection's S/N (its "snr", or snr), with
     p_max = 1 / (number of detected groups). Detected groups that are neither are
-    false alarms, or real signals already in the data.
+    false alarms, or real signals already in the data. confirm_fap is passed to
+    search_timeseries.
 
     Returns
     -------
@@ -212,6 +214,7 @@ def injection_test(
         outdir,
         prefix,
         snr_threshold=snr_threshold,
+        confirm_fap=confirm_fap,
         loki_site=loki_site,
         sweep_kwargs=sweep_kwargs,
     )
