@@ -560,6 +560,85 @@ def box_widths(nbins: int, ducy_max: float, wtsp: float) -> list[int]:
     return widths
 
 
+def _boxcar_snr(fold_e: np.ndarray, fold_v: np.ndarray, widths: list[int]) -> float:
+    """S/N of one fold as loki's snr_boxcar_3d_max scores it."""
+    nbins = len(fold_e)
+    profile = fold_e / np.sqrt(fold_v)
+    total = profile.sum()
+    cumsum = np.concatenate([[0.0], np.cumsum(np.tile(profile, 2))])
+    snr = -math.inf
+    for w in widths:
+        h = math.sqrt((nbins - w) / (nbins * w))
+        b = w * h / (nbins - w)
+        window_max = (cumsum[w : w + nbins] - cumsum[:nbins]).max()
+        snr = max(snr, (h + b) * window_max - b * total)
+    return snr
+
+
+def fold_nbins(cfg_kwargs: dict[str, Any], freqs: np.ndarray) -> np.ndarray:
+    """Return the bins the search folds each frequency with: its region's nbins."""
+    regions = sorted(
+        (region["f_start"], int(region["nbins"]))
+        for region, _ in region_configs(cfg_kwargs)
+    )
+    starts = [start for start, _ in regions]
+    index = np.maximum(np.searchsorted(starts, freqs, side="right") - 1, 0)
+    return np.array([regions[i][1] for i in index], dtype=np.int64)
+
+
+def refold_snr(
+    ts_e: np.ndarray,
+    ts_v: np.ndarray,
+    cfg_kwargs: dict[str, Any],
+    cands: pd.DataFrame,
+) -> np.ndarray:
+    """S/N of each candidate in an exact fold of the time series.
+
+    EPFreqSweep scores folds built by its FFA, whose phase errors (shifts rounded to
+    whole bins, frequencies snapped to each level's grid) repeat in every block of a
+    level. Their spectrum has lines at multiples of 1 / (2^p tsamp), 2^p a block
+    length, so a strong signal at f0 leaks into trials with b f - a f0 =
+    +-1 / (2^p tsamp), at its own drift parameters and a few percent of its S/N, and
+    the segments add the leak coherently. Here each sample is binned at its own phase
+    freq * (tau - sum_k d_k tau^(k+1) / ((k+1)! c)), tau the time from the middle of
+    the data where EPFreqSweep reports the parameters: such trials score as noise.
+    Each candidate is folded with its region's nbins and scored as loki does.
+
+    Returns
+    -------
+    np.ndarray
+        One S/N per row of cands.
+    """
+    nsamps = len(ts_e)
+    tsamp = cfg_kwargs["tsamp"]
+    names = cands.attrs["param_names"]
+    drifts = names[:-1]  # highest order first
+    tau = (np.arange(nsamps) - nsamps / 2) * tsamp
+    tau_terms = [
+        tau ** (len(drifts) - i + 1)
+        / (math.factorial(len(drifts) - i + 1) * speed_of_light)
+        for i in range(len(drifts))
+    ]
+    ts_e = np.asarray(ts_e, dtype=np.float64)
+    ts_v = np.asarray(ts_v, dtype=np.float64)
+    all_nbins = fold_nbins(cfg_kwargs, cands["freq"].to_numpy())
+    snr = np.empty(len(cands))
+    for i, params in enumerate(cands[names].itertuples(index=False)):
+        *drift_values, freq = params
+        nbins = int(all_nbins[i])
+        delay = tau.copy()
+        for value, term in zip(drift_values, tau_terms, strict=True):
+            delay -= value * term
+        phase_bin = ((freq * delay) % 1.0 * nbins).astype(np.int64)
+        phase_bin = np.minimum(phase_bin, nbins - 1)  # a phase rounding up to 1
+        snr[i] = _boxcar_snr(
+            np.bincount(phase_bin, weights=ts_e, minlength=nbins),
+            np.bincount(phase_bin, weights=ts_v, minlength=nbins),
+            box_widths(nbins, cfg_kwargs["ducy_max"], cfg_kwargs["wtsp"]),
+        )
+    return snr
+
+
 def search_timeseries(
     ts_e: np.ndarray,
     ts_v: np.ndarray,
