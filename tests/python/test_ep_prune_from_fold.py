@@ -93,3 +93,17 @@ def test_execute_pruning_refuses_to_copy(tmp_path: Path) -> None:
     strided = np.repeat(fold, 2)[::2]
     with pytest.raises(TypeError, match="used in place"):
         _ep(cfg).execute_pruning(strided, str(tmp_path), "strided")
+
+
+def test_execute_twice_reallocates_the_ffa(tmp_path: Path) -> None:
+    # execute() releases its FFA buffers after the FFA; a second call on the
+    # same object must allocate them again and give the same candidates.
+    cfg = _config()
+    ts_e, ts_v = _series()
+    ep = _ep(cfg)
+    ep.execute(ts_e, ts_v, str(tmp_path / "first"), "first")
+    ep.execute(ts_e, ts_v, str(tmp_path / "second"), "second")
+    first = _candidates(tmp_path / "first", "first")
+    second = _candidates(tmp_path / "second", "second")
+    assert first.shape[0] > 0
+    np.testing.assert_allclose(second, first, rtol=1e-6, atol=1e-9)
