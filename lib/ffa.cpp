@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <optional>
 #include <type_traits>
 #include <utility>
 
@@ -417,15 +418,21 @@ compute_ffa(std::span<const float> ts_e,
             bool quiet,
             bool show_progress) {
     timing::ScopedLogLevel scoped_log_level(quiet);
-    FFA<FoldType> ffa(cfg, show_progress);
-    const plans::FFAPlan<FoldType>& ffa_plan = ffa.get_plan();
-    const auto buffer_size                   = ffa_plan.get_buffer_size();
-    std::vector<FoldType> fold(buffer_size, FoldType{});
-    ffa.execute(ts_e, ts_v, std::span<FoldType>(fold));
-    // RESIZE to actual result size
-    const auto fold_size = ffa_plan.get_fold_size();
-    fold.resize(fold_size);
-    return {std::move(fold), std::move(ffa).extract_plan()};
+    std::vector<FoldType> fold;
+    std::optional<plans::FFAPlan<FoldType>> plan;
+    {
+        FFA<FoldType> ffa(cfg, show_progress);
+        const plans::FFAPlan<FoldType>& ffa_plan = ffa.get_plan();
+        fold.assign(ffa_plan.get_buffer_size(), FoldType{});
+        ffa.execute(ts_e, ts_v, std::span<FoldType>(fold));
+        // The result is the first get_fold_size() elements of the buffer.
+        fold.resize(ffa_plan.get_fold_size());
+        plan.emplace(std::move(ffa).extract_plan());
+    } // the FFA's own scratch buffer is freed here
+    // resize() keeps the buffer's capacity; release it. With the scratch
+    // already freed, this copy stays below the FFA's peak.
+    fold.shrink_to_fit();
+    return {std::move(fold), std::move(*plan)};
 }
 
 std::tuple<std::vector<float>, plans::FFAPlan<float>>

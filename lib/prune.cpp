@@ -991,12 +991,11 @@ public:
         // enforce this.
         m_workspaces_view = std::span(m_workspace_storage);
 
-        // Allocate internal FFA resources
-        m_ffa_workspace_storage = memory::FFAWorkspace<FoldType>(m_ffa_plan);
-        m_ffa_workspace_ptr     = &m_ffa_workspace_storage;
-        m_fft_ptr               = &m_fft_storage;
-        m_ffa_fold_storage.resize(m_ffa_plan.get_buffer_size(), FoldType{});
-        m_ffa_fold_span = std::span(m_ffa_fold_storage);
+        // Internal FFA resources are allocated by run_ffa() and released
+        // again once the FFA has run, so execute_pruning() never allocates
+        // them.
+        m_owns_ffa_resources = true;
+        m_fft_ptr            = &m_fft_storage;
     }
 
     // External workspace constructor
@@ -1045,12 +1044,11 @@ public:
                         m_cfg.get_nparams(), nbins, nsegments);
         }
 
-        // Allocate internal FFA resources
-        m_ffa_workspace_storage = memory::FFAWorkspace<FoldType>(m_ffa_plan);
-        m_ffa_workspace_ptr     = &m_ffa_workspace_storage;
-        m_fft_ptr               = &m_fft_storage;
-        m_ffa_fold_storage.resize(m_ffa_plan.get_buffer_size(), FoldType{});
-        m_ffa_fold_span = std::span(m_ffa_fold_storage);
+        // Internal FFA resources are allocated by run_ffa() and released
+        // again once the FFA has run, so execute_pruning() never allocates
+        // them.
+        m_owns_ffa_resources = true;
+        m_fft_ptr            = &m_fft_storage;
     }
 
     // Fully external pipeline constructor: external EP workspaces, external
@@ -1126,16 +1124,68 @@ public:
         timing::SimpleTimer timer;
         timer.start();
         spdlog::info("EPMultiPass: Initializing with FFA");
+        const auto ffa_fold = run_ffa(ts_e, ts_v);
+        prune_and_report(ffa_fold, outdir, file_prefix, timer);
+    }
 
-        auto ffa = FFA<FoldType>(*m_ffa_workspace_ptr, *m_fft_ptr, m_cfg,
-                                 m_show_progress);
+    // Prune a precomputed final FFA fold (from compute_ffa, or a read-only
+    // memory map of one saved to disk), skipping the FFA stage. Several
+    // processes can prune one fold this way, each holding only its pruning
+    // workspaces.
+    void execute_pruning(std::span<const FoldType> ffa_fold,
+                         const std::filesystem::path& outdir,
+                         std::string_view file_prefix) {
+        error_check::check(
+            ffa_fold.size() == m_ffa_plan.get_fold_size(),
+            std::format("EPMultiPass::execute_pruning: ffa_fold has {} "
+                        "elements, but this configuration's FFA plan has a "
+                        "final fold of {}",
+                        ffa_fold.size(), m_ffa_plan.get_fold_size()));
+        timing::SimpleTimer timer;
+        timer.start();
+        spdlog::info("EPMultiPass: pruning a precomputed FFA fold");
+        prune_and_report(ffa_fold, outdir, file_prefix, timer);
+    }
+
+private:
+    // Run the FFA and return its final fold, which is the first
+    // get_fold_size() elements of the buffer. With owned FFA resources, the
+    // FFA scratch is then freed and the buffer shrunk to the final fold, so
+    // pruning holds about one fold instead of two FFA-sized buffers.
+    std::span<const FoldType> run_ffa(std::span<const float> ts_e,
+                                      std::span<const float> ts_v) {
         const auto buffer_size = m_ffa_plan.get_buffer_size();
         const auto fold_size   = m_ffa_plan.get_fold_size();
-        auto fold_span         = m_ffa_fold_span.first(buffer_size);
-        ffa.execute(ts_e, ts_v, fold_span);
-        const auto ffa_fold =
-            std::span<const FoldType>(fold_span).first(fold_size);
+        if (m_owns_ffa_resources) {
+            m_ffa_workspace_storage =
+                memory::FFAWorkspace<FoldType>(m_ffa_plan);
+            m_ffa_workspace_ptr = &m_ffa_workspace_storage;
+            m_ffa_fold_storage.resize(buffer_size, FoldType{});
+            m_ffa_fold_span = std::span(m_ffa_fold_storage);
+        }
+        {
+            auto ffa = FFA<FoldType>(*m_ffa_workspace_ptr, *m_fft_ptr, m_cfg,
+                                     m_show_progress);
+            ffa.execute(ts_e, ts_v, m_ffa_fold_span.first(buffer_size));
+        }
+        if (!m_owns_ffa_resources) {
+            return std::span<const FoldType>(m_ffa_fold_span).first(fold_size);
+        }
+        // Free the scratch before shrinking: shrink_to_fit copies the final
+        // fold, and with the scratch gone that copy stays below the FFA
+        // stage's own peak.
+        m_ffa_workspace_storage = memory::FFAWorkspace<FoldType>();
+        m_ffa_workspace_ptr     = nullptr;
+        m_ffa_fold_storage.resize(fold_size);
+        m_ffa_fold_storage.shrink_to_fit();
+        m_ffa_fold_span = std::span(m_ffa_fold_storage);
+        return m_ffa_fold_span;
+    }
 
+    void prune_and_report(std::span<const FoldType> ffa_fold,
+                          const std::filesystem::path& outdir,
+                          std::string_view file_prefix,
+                          timing::SimpleTimer& timer) {
         // Setup output files and directory
         const auto nsegments = m_ffa_plan.get_nsegments().back();
         const std::string filebase =
@@ -1191,7 +1241,6 @@ public:
         spdlog::info("Pruning time: {:.2f} seconds", ep_time);
     }
 
-private:
     // Pool of owned workspaces
     std::vector<memory::EPWorkspace<FoldType>> m_workspace_storage;
     std::span<memory::EPWorkspace<FoldType>> m_workspaces_view;
@@ -1203,6 +1252,7 @@ private:
     math::FFTWManager* m_fft_ptr{nullptr};
     std::vector<FoldType> m_ffa_fold_storage;
     std::span<FoldType> m_ffa_fold_span;
+    bool m_owns_ffa_resources{false};
 
     search::PulsarSearchConfig m_cfg;
     std::vector<float> m_threshold_scheme;
@@ -1452,6 +1502,14 @@ void EPMultiPass<FoldType>::execute(std::span<const float> ts_e,
                                     const std::filesystem::path& outdir,
                                     std::string_view file_prefix) {
     m_impl->execute(ts_e, ts_v, outdir, file_prefix);
+}
+
+template <SupportedFoldType FoldType>
+void EPMultiPass<FoldType>::execute_pruning(
+    std::span<const FoldType> ffa_fold,
+    const std::filesystem::path& outdir,
+    std::string_view file_prefix) {
+    m_impl->execute_pruning(ffa_fold, outdir, file_prefix);
 }
 
 // Explicit instantiation

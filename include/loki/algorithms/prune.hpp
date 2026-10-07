@@ -82,6 +82,17 @@ public:
                  const std::filesystem::path& outdir = "./",
                  std::string_view file_prefix        = "test");
 
+    /**
+     * @brief Prune a precomputed final FFA fold, skipping the FFA stage.
+     *
+     * @param ffa_fold The final fold of this configuration's FFA plan (as
+     * returned by compute_ffa), e.g. a read-only memory map shared between
+     * processes. Its size must equal the plan's fold size.
+     */
+    void execute_pruning(std::span<const FoldType> ffa_fold,
+                         const std::filesystem::path& outdir = "./",
+                         std::string_view file_prefix        = "test");
+
 private:
     class Impl;
     std::unique_ptr<Impl> m_impl;

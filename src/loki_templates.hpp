@@ -262,6 +262,28 @@ void bind_ep_multi_pass(py::module& m, const std::string& name) {
         },
         py::arg("ts_e"), py::arg("ts_v"), py::arg("outdir"),
         py::arg("file_prefix"));
+
+    // Prune a precomputed final FFA fold (e.g. compute_ffa's result saved with
+    // numpy.save and opened with numpy.load(mmap_mode="r")). The fold is used
+    // in place: an array that would need a copy (wrong dtype, not
+    // C-contiguous) is refused instead of silently copied.
+    cls.def(
+        "execute_pruning",
+        [](EPMultiPass<FoldType>& self, const py::array& ffa_fold,
+           std::string_view outdir, std::string_view file_prefix) {
+            if (!py::isinstance<py::array_t<FoldType>>(ffa_fold) ||
+                (ffa_fold.flags() & py::array::c_style) == 0) {
+                throw py::type_error(
+                    "execute_pruning: ffa_fold must be a C-contiguous array "
+                    "of the fold's dtype; it is used in place, not copied");
+            }
+            const auto* data = static_cast<const FoldType*>(ffa_fold.data());
+            self.execute_pruning(
+                std::span<const FoldType>(
+                    data, static_cast<SizeType>(ffa_fold.size())),
+                outdir, file_prefix);
+        },
+        py::arg("ffa_fold"), py::arg("outdir"), py::arg("file_prefix"));
 }
 
 } // namespace loki
