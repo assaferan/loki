@@ -97,6 +97,74 @@ GPU to run. wexac (Weizmann LSF cluster) has about 700 GPUs, so now we can.
 - Report to `pyloki-79` when the build works, and for each item when its test fails on main and
   passes with the fix.
 
-## State
+## State (2026-10-11, cuda-on-wexac session)
 
-Nothing done yet beyond creating this branch.
+**Build: works.** Env `loki-cuda` (conda-forge gcc 13.4, cuda-nvcc 12.6.85 + cudart/cufft/curand/
+cccl/compute-sanitizer, cmake 4.4, hdf5 2.2, fftw, python 3.12), clone `~/src/loki-cuda` at
+94c1eaa (remotes: `origin` = pravirkr, `fork` = assaferan), build dir `build-cuda` from
+`cmake --preset cuda -DLOKI_CUDA=AUTO -DLOKI_CUDA_ARCHITECTURES=86 -DLOKI_ENABLE_NATIVE_ARCH=OFF
+-DCMAKE_CXX_FLAGS=-march=x86-64-v3 -DLOKI_BUILD_BENCHMARKS=OFF`. All 233 compile/link steps
+pass in ~10 min on 8 cores (peak 4.4 GB). Scripts in `~/src`: `loki_cuda_env.sh`,
+`build_loki_cuda.sh` (CPU `short` queue), `test_loki_cuda.sh` (GPU: finishes the build, then
+ctest + pytest), `verify_patch.sh <patch> <ctest-regex>` (tests of a patch against the unpatched
+library, then with it), `run_patch_tests.sh`. Patches in `~/src/patches/`.
+
+Gotchas found: (a) `AUTO` + an explicit architecture needs no `nvidia-smi`, so the compile can
+run on a CPU queue; (b) Catch2's `catch_discover_tests` runs the test binaries at build time and
+they need `libcuda.so.1`, which CPU nodes lack: the last build steps must run in the GPU job;
+(c) the `short` queue is preemptable and jobs are rerunnable: a preemption mid-configure left a
+half-extracted CPM package and broke the rerun. Configure once on the login node first.
+
+**Fixes, one worktree/branch each under `/Users/eranasaf/GitHub/loki-wt/`, from upstream/main:**
+
+1. `fix-branch-overflow-cuda` (c48bcff, pushed, pravirkr/loki PR #27): host check of the branched total against the output
+   capacity before the mask memset and the materialize kernel in taylor/chebyshev/circular;
+   capacity-bounded crackle append; per-parameter overflow flag (`kBranchFlagOverflow` in
+   `CUBScratchArena::d_reduce_out`, the circular crackle flag is `kBranchFlagCrackle`); the
+   device point generator never writes past its slot. Test
+   `tests/cpp/internal/branch_capacity_cuda_t.cpp` (GPU twin of `branch_capacity_t.cpp`, plus
+   CPU-count parity). `test_ep_branch_overflow.py` parametrized over backend. Note: upstream's
+   e98c294 already sizes `branch_max` from the worst simulated leaf on both backends, so the
+   halving retry of 56a0146 is gone; only the guards were missing on CUDA.
+2. `fix-add-initial-cuda` (b768f7b, pushed, PR #28): the 3-line
+   `check_greater_equal` port + `tests/cpp/internal/world_tree_cuda_t.cpp`.
+3. `ffa-sweep-cuda-parity` (80dbd97, pushed, PR #29): upstream b009dce already re-uploads `m_widths_d` per
+   chunk and bounds the accumulator, i.e. our `fix-ffa-freq-sweep-cuda` is superseded.
+   `tests/cpp/api/ffa_sweep_parity_t.cpp` checks CPU vs CUDA on a 50-500 Hz multi-chunk sweep.
+
+**GPU results (short-gpu, NVIDIA A40, sm_86, driver 595.58, CUDA 12.6.85):**
+
+- Upstream main 94c1eaa: ctest 269/269 (job 692077), pytest 60/60 (692184). Note
+  `CUDA_VISIBLE_DEVICES` listed all 8 GPUs of the host despite `-gpu num=1`; the tests use
+  device 0. The Python package reads its version from installed metadata: a metadata-only
+  `loki-0.0.3.dist-info` in the env's site-packages makes `PYTHONPATH=src` imports work.
+- Item 2 (692079): the new test fails on main with "slots_to_write must match batch_scores
+  size (25 == 40)", passes with the fix; full ctest 271/271. Upstream's own CUDA sweep tests
+  pass on main because every nbins group there has one chunk. A sweep-level reproduction
+  (`~/src/ep_sweep_groups_repro.py`, jobs 692239..693124) tried ~30 configurations (70-145 /
+  70-300 Hz, 2^16..2^22 samples, accel boxes to +-1000 and a jerk box, budgets 2..16 GB, FFA
+  segments 1/8 to 1/4 of the data): the CUDA planner always kept one chunk per nbins region
+  (up to 701559 coords in one chunk at 8 GB) or refused the budget on the fixed buffers. So
+  the failure needs a region the planner cuts into chunks of different ncoords, which these
+  sizes never produce; the evidence stays the unit test and the code path (`ep_chunking`:
+  `GroupMaxima::absorb` takes the max ncoords of the group; `EPMultiPassCudaCore::initialize`
+  passes the whole `seed_scores_d` with the chunk's own count).
+- Item 1 (692803): on main, 4 leaves x 216 children against a 32-slot span wrote 832 leaf
+  slots and 832 validation-mask bytes past the span and nothing threw; the per-parameter
+  overflow case did not throw either; the batch that fits matches the CPU count, origins and
+  leaves. With the fix: 34/34 CUDA-tagged tests, full ctest 272/272, pytest overflow test on
+  both backends. Earlier runs (692080, 692307, 692737) were my test's fault: internal kernels
+  need an active `cuda_utils::CudaSetDeviceGuard` (thread-local device id) or the launch
+  checks fail with cudaErrorInvalidDevice.
+- Item 3 (693077): the parity test passes on upstream main: 3 chunks (64/128/256 bins), 64490
+  candidates on both backends, S/N within 1e-3 relative. Our `fix-ffa-freq-sweep-cuda` is
+  superseded. Two findings for the test: the two backends decode the same grid cell to
+  frequencies differing in the last bits (match by nearest f0), and a strong candidate can
+  sit on a neighbouring boxcar width on the GPU (compare widths as a set, S/N as the cell's
+  best over widths).
+
+Commit messages with the measured numbers: `commit_messages.md` next to this file (as
+committed). assaferan approved commit, push and PRs on 2026-10-11 after reading the results.
+Logs: `~/src/loki-cuda-test.692077.log`, `~/src/pytest-main.692184.log`,
+`~/src/verify-add-initial.692079.log`, `~/src/verify-branch-overflow.692803.log`,
+`~/src/ffa-sweep-parity.693077.log`, `~/src/repro-item2.*.log`.
