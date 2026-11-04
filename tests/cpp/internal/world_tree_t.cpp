@@ -7,6 +7,7 @@
 
 #include <catch2/catch_template_test_macros.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include "loki/common/types.hpp"
 
@@ -49,10 +50,20 @@ template <typename T> std::vector<float> live_scores(const WorldTree<T>& tree) {
 
 } // namespace
 
-TEMPLATE_TEST_CASE("WorldTree overflow keeps the scores above the pool median",
+TEMPLATE_TEST_CASE("WorldTree overflow keeps at most keep_fraction of the pool",
                    "[world_tree]",
                    float,
                    ComplexType) {
+    // 2 * kBatch candidates for kCapacity slots. The fraction ranks the
+    // lowest score that may stay; past rank kCapacity - 1 the top-k decides.
+    // 0.5 is the median of the pool.
+    const auto [keep_fraction, n_kept] = GENERATE(table<double, SizeType>({
+        {0.5, 40},
+        {0.75, 60},
+        {0.9, 63},
+        {1.0, 63},
+    }));
+    CAPTURE(keep_fraction);
     constexpr SizeType kCapacity = 64;
     constexpr SizeType kNParams  = 2;
     constexpr SizeType kNBins    = 8;
@@ -89,25 +100,29 @@ TEMPLATE_TEST_CASE("WorldTree overflow keeps the scores above the pool median",
     tree.prepare_in_place_update();
     tree.consume_read(kNSeeds);
 
-    float threshold =
-        tree.add_batch_scattered(leaves, folds, scores, identity, 0.0F, kBatch);
+    // A batch that fits is stored whatever the fraction.
+    float threshold = tree.add_batch_scattered(leaves, folds, scores, identity,
+                                               0.0F, kBatch, keep_fraction);
     REQUIRE(threshold == 0.0F);
     REQUIRE(tree.get_size() == kBatch);
+    REQUIRE(tree.get_n_overloads() == 0);
 
-    // 2 * kBatch candidates for kCapacity slots: the median of the pool
-    // (rank kBatch from the top) decides, so the kBatch highest stay.
+    // The pool is 0, 1, ..., 2 * kBatch - 1, so the n_kept highest stay.
+    const auto n_pool = 2 * kBatch;
     make_batch(1, leaves, folds, scores);
     threshold = tree.add_batch_scattered(leaves, folds, scores, identity,
-                                         threshold, kBatch);
-    REQUIRE(threshold > static_cast<float>(kBatch - 1));
-    REQUIRE(threshold <= static_cast<float>(kBatch));
-    REQUIRE(tree.get_size() == kBatch);
+                                         threshold, kBatch, keep_fraction);
+    REQUIRE(tree.get_n_overloads() == 1);
+    REQUIRE(threshold > static_cast<float>(n_pool - n_kept - 1));
+    REQUIRE(threshold <= static_cast<float>(n_pool - n_kept));
+    REQUIRE(tree.get_size() == n_kept);
     tree.finalize_in_place_update();
 
     auto kept = live_scores(tree);
     std::ranges::sort(kept);
-    std::vector<float> expected(kBatch);
-    std::iota(expected.begin(), expected.end(), static_cast<float>(kBatch));
+    std::vector<float> expected(n_kept);
+    std::iota(expected.begin(), expected.end(),
+              static_cast<float>(n_pool - n_kept));
     REQUIRE(kept == expected);
 }
 

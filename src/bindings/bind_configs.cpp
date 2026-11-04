@@ -151,7 +151,8 @@ void bind_configs(py::module_& m) {
                     double p_orb_min, double m_c_max, double m_p_min,
                     double propagator_significance,
                     double validation_significance, bool use_conservative_tile,
-                    bool use_boxcar_kadane, std::optional<double> target_snr) {
+                    bool use_boxcar_kadane, std::optional<double> target_snr,
+                    double overflow_keep_fraction) {
                      if (param_limits.ndim() != 2 ||
                          param_limits.shape(1) != 2) {
                          throw std::invalid_argument(
@@ -176,7 +177,8 @@ void bind_configs(py::module_& m) {
                          bseg_brute, bseg_ffa, snr_min, max_passing_candidates,
                          prune_poly_order, p_orb_min, m_c_max, m_p_min,
                          propagator_significance, validation_significance,
-                         use_conservative_tile, use_boxcar_kadane, target_snr);
+                         use_conservative_tile, use_boxcar_kadane, target_snr,
+                         overflow_keep_fraction);
                  }),
              py::arg("nsamps"), py::arg("tsamp"), py::arg("nbins"),
              py::arg("eta"), py::arg("param_limits"), py::arg("ducy_max") = 0.2,
@@ -193,7 +195,8 @@ void bind_configs(py::module_& m) {
              py::arg("validation_significance") = 5.0,
              py::arg("use_conservative_tile")   = false,
              py::arg("use_boxcar_kadane")       = false, py::kw_only(),
-             py::arg("target_snr")              = std::nullopt)
+             py::arg("target_snr")              = std::nullopt,
+             py::arg("overflow_keep_fraction")  = 0.5)
         .def_property_readonly(
             "target_snr", &PulsarSearchConfig::get_target_snr,
             "EP entropic information limit; None selects the parameter-count "
@@ -208,7 +211,12 @@ void bind_configs(py::module_& m) {
         .def_property_readonly("validation_significance",
                                &PulsarSearchConfig::get_validation_significance)
         .def_property_readonly("x_mass_const",
-                               &PulsarSearchConfig::get_x_mass_const);
+                               &PulsarSearchConfig::get_x_mass_const)
+        .def_property_readonly(
+            "overflow_keep_fraction",
+            &PulsarSearchConfig::get_overflow_keep_fraction,
+            "Fraction of the pool (the stage's survivors so far and the batch) "
+            "a full world tree keeps when a batch overflows it, in (0, 1].");
 
     m_configs.attr("EPSearchConfig") = m_configs.attr("PulsarSearchConfig");
 
