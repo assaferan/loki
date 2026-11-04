@@ -562,8 +562,9 @@ TEST_CASE("Final CUDA EP width ties select the first configured width",
     }
     // Power-of-two transforms keep the zero signal exact. Bluestein may
     // introduce tiny nonzero samples, so that input is not an exact score tie.
-    for (const auto [nbins, kN] :
-         {std::pair<SizeType, SizeType>{32, 17}, {64, 65536}, {128, 17}}) {
+    for (const auto [nbins, kN] : {std::pair<SizeType, SizeType>{32, 17},
+                                   std::pair<SizeType, SizeType>{64, 65536},
+                                   std::pair<SizeType, SizeType>{128, 17}}) {
         CAPTURE(nbins, kN);
         const SizeType nf = nbins / 2 + 1;
         std::vector<ComplexTypeCUDA> folds_h(kN * 2 * nf,
