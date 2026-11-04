@@ -1,5 +1,6 @@
 #include "lib/utils/world_tree.hpp"
 
+#include <algorithm>
 #include <numeric>
 #include <span>
 #include <vector>
@@ -23,7 +24,92 @@ template <typename T> T make_value(SizeType i) {
     }
 }
 
+/// Scores of the live leaves of a tree that is not updating, in buffer order,
+/// each checked against the first value of its leaf (the tests store a leaf's
+/// score there).
+template <typename T> std::vector<float> live_scores(const WorldTree<T>& tree) {
+    const auto view   = tree.get_scores_circular_view();
+    const auto leaves = tree.get_leaves_circular_view();
+    const auto stride = tree.get_leaves_stride();
+    std::vector<float> out(view.first.begin(), view.first.end());
+    out.insert(out.end(), view.second.begin(), view.second.end());
+    std::vector<double> firsts;
+    for (SizeType i = 0; i < leaves.first.size(); i += stride) {
+        firsts.push_back(leaves.first[i]);
+    }
+    for (SizeType i = 0; i < leaves.second.size(); i += stride) {
+        firsts.push_back(leaves.second[i]);
+    }
+    REQUIRE(firsts.size() == out.size());
+    for (SizeType i = 0; i < out.size(); ++i) {
+        REQUIRE(firsts[i] == static_cast<double>(out[i]));
+    }
+    return out;
+}
+
 } // namespace
+
+TEMPLATE_TEST_CASE("WorldTree overflow keeps the scores above the pool median",
+                   "[world_tree]",
+                   float,
+                   ComplexType) {
+    constexpr SizeType kCapacity = 64;
+    constexpr SizeType kNParams  = 2;
+    constexpr SizeType kNBins    = 8;
+    constexpr SizeType kBatch    = 40;
+    constexpr SizeType kNSeeds   = 8;
+
+    WorldTree<TestType> tree(kCapacity, kNParams, kNBins, kBatch);
+    const auto leaves_stride = tree.get_leaves_stride();
+    const auto folds_stride  = tree.get_folds_stride();
+
+    // Two batches of kBatch leaves: the first holds the even scores, the
+    // second the odd ones, so the pool of both is 0, 1, ..., 2 * kBatch - 1.
+    // Each leaf stores its score as its first value.
+    auto make_batch = [&](SizeType parity, std::vector<double>& leaves,
+                          std::vector<TestType>& folds,
+                          std::vector<float>& scores) {
+        leaves.assign(kBatch * leaves_stride, 0.0);
+        folds.assign(kBatch * folds_stride, make_value<TestType>(1));
+        scores.resize(kBatch);
+        for (SizeType i = 0; i < kBatch; ++i) {
+            scores[i]                 = static_cast<float>((2 * i) + parity);
+            leaves[i * leaves_stride] = static_cast<double>(scores[i]);
+        }
+    };
+    std::vector<double> leaves;
+    std::vector<TestType> folds;
+    std::vector<float> scores;
+    std::vector<SizeType> identity(kBatch);
+    std::iota(identity.begin(), identity.end(), SizeType{0});
+
+    // Consume every parent first, so the whole ring is free for the new level.
+    make_batch(0, leaves, folds, scores);
+    tree.add_initial(leaves, folds, scores, kNSeeds);
+    tree.prepare_in_place_update();
+    tree.consume_read(kNSeeds);
+
+    float threshold =
+        tree.add_batch_scattered(leaves, folds, scores, identity, 0.0F, kBatch);
+    REQUIRE(threshold == 0.0F);
+    REQUIRE(tree.get_size() == kBatch);
+
+    // 2 * kBatch candidates for kCapacity slots: the median of the pool
+    // (rank kBatch from the top) decides, so the kBatch highest stay.
+    make_batch(1, leaves, folds, scores);
+    threshold = tree.add_batch_scattered(leaves, folds, scores, identity,
+                                         threshold, kBatch);
+    REQUIRE(threshold > static_cast<float>(kBatch - 1));
+    REQUIRE(threshold <= static_cast<float>(kBatch));
+    REQUIRE(tree.get_size() == kBatch);
+    tree.finalize_in_place_update();
+
+    auto kept = live_scores(tree);
+    std::ranges::sort(kept);
+    std::vector<float> expected(kBatch);
+    std::iota(expected.begin(), expected.end(), static_cast<float>(kBatch));
+    REQUIRE(kept == expected);
+}
 
 TEMPLATE_TEST_CASE("WorldTree::add_initial_scattered matches add_initial",
                    "[world_tree]",

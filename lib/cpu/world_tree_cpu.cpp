@@ -710,13 +710,14 @@ float WorldTree<FoldType>::get_prune_threshold(
     const float topk_threshold =
         std::nextafter(*kth, std::numeric_limits<float>::max());
 
-    // Median score for severity (restricted range)
+    // Median score for severity (restricted range). [begin, kth) holds the
+    // total_capacity - 1 highest scores, so a median ranked at or past kth
+    // leaves the top-k threshold in charge.
     auto const mid = begin + total_candidates / 2;
-    if (mid <= kth) {
-        std::nth_element(begin, mid, kth + 1);
-    } else {
-        std::nth_element(kth + 1, mid, end);
+    if (mid >= kth) {
+        return std::max(current_threshold, topk_threshold);
     }
+    std::nth_element(begin, mid, kth, std::greater<float>());
     const float median_threshold =
         std::nextafter(*mid, std::numeric_limits<float>::max());
     return std::max({current_threshold, topk_threshold, median_threshold});
